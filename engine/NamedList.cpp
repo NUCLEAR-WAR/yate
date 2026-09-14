@@ -475,7 +475,7 @@ bool NamedList::hasSubParams(const char* prefix) const
     return false;
 }
 
-void NamedList::dump(String& str, const char* separator, char quote, bool force) const
+String& NamedList::dump(String& str, const char* separator, char quote, bool force) const
 {
     if (force && str.null())
 	str << separator;
@@ -487,6 +487,7 @@ void NamedList::dump(String& str, const char* separator, char quote, bool force)
 	tmp << quote << s->name() << quote << "=" << quote << *s << quote;
 	str.append(tmp,separator);
     }
+    return str;
 }
 
 bool NamedList::dump(String& str, unsigned int flags, const char* separator,

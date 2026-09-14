@@ -9219,8 +9219,9 @@ public:
      * @param separator Separator string to use before each parameter
      * @param quote String quoting character, usually single or double quote
      * @param force True to insert the separator even in an empty string
+     * @return Destination buffer reference
      */
-    void dump(String& str, const char* separator, char quote = 0, bool force = false) const;
+    String& dump(String& str, const char* separator, char quote = 0, bool force = false) const;
 
     /**
      * List dump
@@ -9259,6 +9260,8 @@ private:
     NamedList(); // no default constructor please
     ObjList m_params;
 };
+
+typedef GenObjectRef<NamedList> NamedListRef;
 
 /**
  * An iterator for NamedString parameters of a NamedList.
