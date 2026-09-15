@@ -28,12 +28,12 @@ using namespace TelEngine;
 
 // Constructor from new message
 SIPTransaction::SIPTransaction(SIPMessage* message, SIPEngine* engine, bool outgoing,
-    bool* autoChangeParty)
+    bool* autoChangeParty, const NamedList* params)
     : m_outgoing(outgoing), m_invite(false), m_transmit(false), m_state(Invalid),
       m_response(0), m_timeouts(0), m_timeout(0),
       m_firstMessage(message), m_lastMessage(0), m_pending(0), m_engine(engine), m_private(0),
       m_autoChangeParty(autoChangeParty ? *autoChangeParty : engine->autoChangeParty()),
-      m_autoAck(true), m_silent(false)
+      m_autoAck(true), m_silent(false), m_autoTrying(true)
 {
     DDebug(getEngine(),DebugAll,"SIPTransaction::SIPTransaction(%p,%p,%d) [%p]",
 	message,engine,outgoing,this);
@@ -53,7 +53,8 @@ SIPTransaction::SIPTransaction(SIPMessage* message, SIPEngine* engine, bool outg
 	if (hl)
 	    m_callid = *hl;
 
-	if (!m_outgoing && m_firstMessage->getParty()) {
+	RefPointer<SIPParty> party;
+	if (!m_outgoing && m_firstMessage->getParty(party)) {
 	    // adjust the address where we send the answers
 	    hl = message->getHeader("Via");
 	    if (hl) {
@@ -62,7 +63,7 @@ SIPTransaction::SIPTransaction(SIPMessage* message, SIPEngine* engine, bool outg
 		uri >> "/" >> "/" >> " ";
 		uri.trimBlanks();
 		uri = "sip:" + uri;
-		m_firstMessage->getParty()->setParty(uri);
+		party->setParty(uri);
 	    }
 	}
     }
@@ -75,7 +76,13 @@ SIPTransaction::SIPTransaction(SIPMessage* message, SIPEngine* engine, bool outg
 	m_engine->traceMsg(m_firstMessage,true);
     }
     else
-      m_traceId = m_firstMessage->msgTraceId;
+	m_traceId = m_firstMessage->msgTraceId;
+    if (params) {
+	setTransCount(params->getIntValue(outgoing ?
+	    YSTRING("xsip_trans_count") : YSTRING("isip_trans_count"),-1));
+	if (!outgoing)
+	    m_autoTrying = params->getBoolValue(YSTRING("auto_trying"),m_autoTrying);
+    }
     m_engine->append(this);
 }
 
@@ -88,7 +95,9 @@ SIPTransaction::SIPTransaction(SIPTransaction& original, SIPMessage* answer)
       m_pending(0), m_engine(original.m_engine),
       m_branch(original.m_branch), m_callid(original.m_callid), m_tag(original.m_tag),
       m_private(0), m_autoChangeParty(original.m_autoChangeParty),
-      m_autoAck(original.m_autoAck), m_silent(original.m_silent), m_traceId(original.traceId())
+      m_autoAck(original.m_autoAck), m_silent(original.m_silent),
+      m_autoTrying(original.m_autoTrying),
+      m_traceId(original.traceId())
 {
     DDebug(getEngine(),DebugAll,"SIPTransaction::SIPTransaction(&%p,%p) [%p]",
 	&original,answer,this);
@@ -134,7 +143,9 @@ SIPTransaction::SIPTransaction(const SIPTransaction& original, const String& tag
       m_pending(0), m_engine(original.m_engine),
       m_branch(original.m_branch), m_callid(original.m_callid), m_tag(tag),
       m_private(0), m_autoChangeParty(original.m_autoChangeParty),
-      m_autoAck(original.m_autoAck), m_silent(original.m_silent), m_traceId(original.traceId())
+      m_autoAck(original.m_autoAck), m_silent(original.m_silent),
+      m_autoTrying(original.m_autoTrying),
+      m_traceId(original.traceId())
 {
     if (m_firstMessage)
 	m_firstMessage->ref();
@@ -236,15 +247,12 @@ void SIPTransaction::setLatestMessage(SIPMessage* message)
 
 void SIPTransaction::setPendingEvent(SIPEvent* event, bool replace)
 {
-    if (m_pending)
-	if (replace) {
-	    delete m_pending;
-	    m_pending = event;
-	}
-	else
-	    delete event;
-    else
+    if (!m_pending || replace) {
+	SIPEvent::release(m_pending);
 	m_pending = event;
+    }
+    else
+	SIPEvent::release(event);
 }
 
 void SIPTransaction::setTransCount(int count)
@@ -273,13 +281,10 @@ void SIPTransaction::setTimeout(u_int64_t delay, unsigned int count)
 
 SIPEvent* SIPTransaction::getEvent(bool pendingOnly, u_int64_t time)
 {
-    SIPEvent *e = 0;
-
     if (m_pending) {
 	if (m_silent)
-	    delete m_pending;
-	else
-	    e = m_pending;
+	    SIPEvent::release(m_pending);
+	SIPEvent* e = m_pending;
 	m_pending = 0;
 	return e;
     }
@@ -306,12 +311,11 @@ SIPEvent* SIPTransaction::getEvent(bool pendingOnly, u_int64_t time)
 	}
     }
 
-    e = isOutgoing() ? getClientEvent(m_state,timeout) : getServerEvent(m_state,timeout);
+    SIPEvent* e = isOutgoing() ? getClientEvent(m_state,timeout) : getServerEvent(m_state,timeout);
     if (e) {
-	if (!m_silent)
-	    return e;
-	delete e;
-	return 0;
+	if (m_silent)
+	    SIPEvent::release(e);
+	return e;
     }
 
     // do some common default processing
@@ -343,13 +347,15 @@ SIPEvent* SIPTransaction::getEvent(bool pendingOnly, u_int64_t time)
     return e;
 }
 
-void SIPTransaction::setResponse(SIPMessage* message)
+void SIPTransaction::setResponse(SIPMessage* message, bool replace)
 {
     if (m_outgoing) {
 	TraceDebugObj(this,getEngine(),DebugWarn,"SIPTransaction::setResponse(%p) in client mode [%p]",message,this);
 	return;
     }
     Lock lock(m_engine);
+    if (m_lastMessage && !replace)
+	return;
     setLatestMessage(message);
     setTransmit();
     if (message && (message->code >= 200)) {
@@ -357,7 +363,7 @@ void SIPTransaction::setResponse(SIPMessage* message)
 	    // we need to actively retransmit this message
 	    // RFC3261 17.2.1: non 2xx are not retransmitted on reliable transports
 	    if (changeState(Retrans)) {
-		bool reliable = message->getParty() && message->getParty()->isReliable();
+		bool reliable = message->isReliable();
 		bool retrans = !reliable || message->code < 300;
 		setTimeout(m_engine->getTimer(retrans ? 'G' : 'H',reliable),
 		    retrans ? getTransCount() : 1);
@@ -387,7 +393,7 @@ bool SIPTransaction::setResponse() const
     return false;
 }
 
-bool SIPTransaction::setResponse(int code, const char* reason)
+bool SIPTransaction::setResponse(int code, const char* reason, bool replace)
 {
     if (m_outgoing) {
 	TraceDebugObj(this,getEngine(),DebugWarn,"SIPTransaction::setResponse(%d,'%s') in client mode [%p]",code,reason,this);
@@ -401,7 +407,7 @@ bool SIPTransaction::setResponse(int code, const char* reason)
     if (!reason)
 	reason = lookup(code,SIPResponses,"Unknown Reason Code");
     SIPMessage* msg = new SIPMessage(m_firstMessage, code, reason);
-    setResponse(msg);
+    setResponse(msg,replace);
     msg->deref();
     return true;
 }
@@ -416,8 +422,8 @@ bool SIPTransaction::setAcknowledge(MimeBody* ackBody)
     m_autoAck = true;
     // build and send the ACK
     SIPMessage* m = new SIPMessage(m_firstMessage,m_lastMessage);
-    if (m_autoChangeParty && m_lastMessage->getParty())
-	m->setParty(m_lastMessage->getParty());
+    if (m_autoChangeParty && m_lastMessage->haveParty())
+	m->setParty(*m_lastMessage);
     m->setBody(ackBody);
     setLatestMessage(m);
     m_lastMessage->deref();
@@ -552,8 +558,8 @@ SIPTransaction::Processed SIPTransaction::processMessage(SIPMessage* message, co
 	    }
 	}
     }
-    if (!message->getParty())
-	message->setParty(m_firstMessage->getParty());
+    if (!message->haveParty())
+	message->setParty(*m_firstMessage);
     if (isOutgoing() != message->isAnswer()) {
 	DDebug(getEngine(),DebugAll,"SIPTransaction ignoring retransmitted %s %p '%s' in [%p]",
 	    message->isAnswer() ? "answer" : "request",
@@ -662,8 +668,7 @@ SIPEvent* SIPTransaction::getClientEvent(int state, int timeout)
 	case Initial:
 	    e = new SIPEvent(m_firstMessage,this);
 	    if (changeState(Trying)) {
-		bool reliable = e->getParty() && e->getParty()->isReliable();
-		if (!reliable)
+		if (!e->isReliable())
 		    setTimeout(m_engine->getTimer(isInvite() ? 'A' : 'E'),getTransCount());
 		else
 		    setTimeout(m_engine->getTimer(isInvite() ? 'B' : 'F',true),1);
@@ -722,10 +727,14 @@ SIPEvent* SIPTransaction::getServerEvent(int state, int timeout)
 	    else if (!m_engine->isAllowed(m_firstMessage->method))
 		setResponse(501);
 	    else {
-		setResponse(100);
-		// if engine is set up lazy skip first 100 transmission
-		if (!isInvite() && m_engine && m_engine->lazyTrying())
-		    m_transmit = false;
+		if (isInvite() && !autoTrying())
+		    ;
+		else {
+		    setResponse(100);
+		    // if engine is set up lazy skip first 100 transmission
+		    if (m_engine && m_engine->lazyTrying())
+			m_transmit = false;
+		}
 		changeState(Trying);
 		break;
 	    }
@@ -778,8 +787,7 @@ void SIPTransaction::msgTransmitFailed(SIPMessage* msg)
 		return;
 	    // Reliable transport: terminate now
 	    // Non reliable: terminate if this is the last attempt
-	    if ((msg->getParty() && msg->getParty()->isReliable()) ||
-		    m_timeouts >= getTransCount()) {
+	    if (msg->isReliable() || m_timeouts >= getTransCount()) {
 		TraceDebugObj(this,getEngine(),DebugInfo,
 		    "SIPTransaction send failed state=%s: clearing [%p]",
 		    stateName(m_state),this);

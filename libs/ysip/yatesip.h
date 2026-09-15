@@ -56,24 +56,90 @@ class SIPEvent;
 class YSIP_API SIPParty : public RefObject
 {
 public:
+    /**
+     * Constructor
+     * @param lck Optional data lock object
+     */
     SIPParty(RWLock* lck = 0);
+
+    /**
+     * Constructor
+     * @param reliable Transport relible indication
+     * @param lck Optional data lock object
+     */
     SIPParty(bool reliable, RWLock* lck = 0);
+
+    /**
+     * Destructor
+     */
     virtual ~SIPParty();
+
     /**
      * Transmit an event
      * @param event Evend to send
      * @return False on fatal failure (subsequent send would fail again)
      */
     virtual bool transmit(SIPEvent* event) = 0;
+
+    /**
+     * Retrieve transport protocol name
+     * @return Transport protocol name (upper case)
+     */
     virtual const char* getProtoName() const = 0;
+
+    /**
+     * Build data from URI
+     * @param uri URI to build from
+     * @return True on success, false otherwise
+     */
     virtual bool setParty(const URI& uri) = 0;
+
+    /**
+     * Retrieve a pointer to transport used by this party
+     * @return Transport pointer, NULL if not set
+     */
     virtual void* getTransport() = 0;
+
+    /**
+     * Set party address
+     * @param addr IP address
+     * @param port Port
+     * @param local True to set local, false to set remote
+     */
     void setAddr(const String& addr, int port, bool local);
+
+    /**
+     * Safely retrieve (fill) addr/port
+     * @param addr Destination for address
+     * @param port Destination for port
+     * @param local True to fill local, false to fill remote
+     */
     inline void getAddr(String& addr, int& port, bool local) {
 	    Lock lck(m_lock,-1,true);
 	    addr = local ? m_local : m_party;
 	    port = local ? m_localPort : m_partyPort;
 	}
+
+    /**
+     * Safely retrieve (fill) addr/port if not set in destination
+     * @param addr Destination for address
+     * @param port Destination for port
+     * @param local True to fill local, false to fill remote
+     */
+    inline void fillMissingAddr(String& addr, int& port, bool local) {
+	    Lock lck(m_lock,-1,true);
+	    if (!addr)
+		addr = local ? m_local : m_party;
+	    if (!port)
+		port = local ? m_localPort : m_partyPort;
+	}
+
+    /**
+     * Append address to buffer
+     * @param buf Destination buffer
+     * @param local True to fill local, false to fill remote
+     * @param unsafe True if unsafe (lock), false if safe (already locked)
+     */
     inline void appendAddr(String& buf, bool local, bool unsafe = true) {
 	    Lock lck(unsafe ? m_lock : 0,-1,true);
 	    if (local)
@@ -81,30 +147,241 @@ public:
 	    else
 		SocketAddr::appendTo(buf,m_party,m_partyPort);
 	}
+
+    /**
+     * Add address to parameters list
+     * @param params Parameters list
+     * @param param Parameter name
+     * @param local True to fill local, false to fill remote
+     * @param unsafe True if unsafe (lock), false if safe (already locked)
+     */
     inline void addAddr(NamedList& params, const char* param, bool local, bool unsafe = true) {
 	    NamedString* ns = new NamedString(param);
 	    appendAddr(*ns,local,unsafe);
 	    params.addParam(ns);
 	}
+
+    /**
+     * Retrieve the data lock
+     * @return RWLock pointer, NULL if not used
+     */
     inline RWLock* lock()
 	{ return m_lock; }
+
+    /**
+     * Retrieve local address.
+     * This method is not thread safe
+     * @return String
+     */
     inline const String& getLocalAddr() const
 	{ return m_local; }
+
+    /**
+     * Retrieve remote address.
+     * This method is not thread safe
+     * @return String
+     */
     inline const String& getPartyAddr() const
 	{ return m_party; }
+
+    /**
+     * Retrieve the local port
+     * @return Local port
+     */
     inline int getLocalPort() const
 	{ return m_localPort; }
+
+    /**
+     * Retrieve the remote port
+     * @return Remote port
+     */
     inline int getPartyPort() const
 	{ return m_partyPort; }
+
+    /**
+     * check if the party transport is reliable
+     * @return True if reliable, false if not
+     */
     inline bool isReliable() const
 	{ return m_reliable; }
+
+    /**
+     * Set Via value (domain/host/port part of Via header)
+     * @param via Via value
+     * @param unsafe True if unsafe (lock), false if safe (already locked)
+     */
+    inline void setVia(const char* via = 0, bool unsafe = true) {
+	    Lock lck(m_lock,-1,true);
+	    m_via = via;
+	}
+
+    /**
+     * Retrieve held Via value (domain/host/port part of Via header)
+     * This method is not thread safe
+     * @return String
+     */
+    inline const String& getVia() const
+	{ return m_via; }
+
+    /**
+     * Fill a buffer with party description
+     * @param buf Destination buffer
+     * @param transPtr True to put transport pointer, false if not requested
+     * @param unsafe True if unsafe (lock), false if safe (already locked)
+     * @return Destination buffer reference
+     */
+    virtual String& describe(String& buf, bool transPtr = false, bool unsafe = true);
+
 protected:
-    RWLock* m_lock;
-    bool m_reliable;
-    String m_local;
-    String m_party;
-    int m_localPort;
-    int m_partyPort;
+    RWLock* m_lock;                      // Data protection lock
+    bool m_reliable;                     // Transport reliable indication
+    String m_local;                      // Local address
+    String m_party;                      // Remote address
+    int m_localPort;                     // Local port
+    int m_partyPort;                     // Remote port
+    String m_via;                        // domain/host/port part of Via header
+};
+
+/**
+ * SIP party holder
+ * @short SIP party holder
+ */
+class YSIP_API SIPPartyHolder
+{
+public:
+    /**
+     * Constructor
+     * @param p Party to set
+     */
+    inline SIPPartyHolder(SIPParty* p = 0)
+	: m_partyLock(s_lockPool.lock(this)), m_party(p)
+	{}
+
+    /**
+     * Constructor
+     * @param p Party to set
+     * @param lck Lockable to use to protect party parameters
+     */
+    inline SIPPartyHolder(SIPParty* p, Lockable* lck)
+	: m_partyLock(lck), m_party(p)
+	{}
+
+    /**
+     * Destructor
+     */
+    inline ~SIPPartyHolder()
+	{ m_party = 0; }
+
+    /**
+     * Check if we hold a party
+     * @return True if we hold a party, false otherwise
+     */
+    inline bool haveParty() const
+	{ return 0 != m_party; }
+
+    /**
+     * Check if we hold a party
+     * @return True if we hold a party, false otherwise
+     */
+    inline Lockable* partyLock()
+	{ return m_partyLock; }
+
+    /**
+     * Set party
+     * @param p Party to set. NULL to reset
+     * @param dbg Optional DebugEnabler to use (debug change)
+     * @param traceId Optional trace id (for debug purposes)
+     */
+    inline void setParty(SIPParty* p = 0, DebugEnabler* dbg = 0,
+	const String& traceId = String::empty()) {
+	    Lock lck(m_partyLock);
+	    if (p == m_party)
+		return;
+	    // Avoid releasing current party while locked
+	    RefPointer<SIPParty> tmp = m_party;
+	    m_party = p;
+	    if (dbg && dbg->debugAt(DebugAll)) {
+		RefPointer<SIPParty> crt(m_party);
+		String tid = traceId;
+		lck.drop();
+		String s;
+		TraceDebug(tid,dbg,DebugAll,"SIPPartyHolder set party (%p)%s%s [%p]",
+		    (SIPParty*)crt,crt ? " " : "",crt ? crt->describe(s).safe() : "",this);
+	    }
+	    lck.drop();
+	}
+
+    /**
+     * Set party from other holder
+     * @param ph Party holder to use
+     */
+    inline void setParty(const SIPPartyHolder& ph) {
+	    RefPointer<SIPParty> p;
+	    setParty(ph.getParty(p));
+	}
+
+    /**
+     * Retrieve held party
+     * @return SIPParty pointer (reference), NULL if not set
+     */
+    inline SIPParty* party() const {
+	    Lock lck(m_partyLock,-1,true);
+	    return (m_party && m_party->ref()) ? m_party : 0;
+	}
+
+    /**
+     * Retrieve held party
+     * @param p Destination for ref holder
+     * @return Pointer to given destination
+     */
+    inline SIPParty* getParty(RefPointer<SIPParty>& p) const {
+	    Lock lck(m_partyLock,-1,true);
+	    p = m_party;
+	    return p;
+	}
+
+    /**
+     * Check if a given transport is used by held party
+     * @param trans Pointer to check
+     * @return True if given transport is used by held party, false otherwise
+     */
+    inline bool isPartyTransport(void* trans) const {
+	    RefPointer<SIPParty> p;
+	    return getParty(p) && trans == p->getTransport();
+	}
+
+    /**
+     * Safely retrieve (fill) addr/port from held party
+     * @param addr Destination for address
+     * @param port Destination for port
+     * @param local True to fill local, false to fill remote
+     */
+    inline void getPartyAddr(String& addr, int& port, bool local) const {
+	    RefPointer<SIPParty> party;
+	    if (getParty(party))
+		party->getAddr(addr,port,local);
+	}
+
+    /**
+     * Retrieve (fill) addr/port if not set in destination and we hold a party
+     * @param addr Destination for address
+     * @param port Destination for port
+     * @param local True to fill local, false to fill remote
+     */
+    inline void fillPartyMissingAddr(String& addr, int& port, bool local) const {
+	    RefPointer<SIPParty> party;
+	    if (getParty(party))
+		party->fillMissingAddr(addr,port,local);
+	}
+
+    /**
+     * Party holder lockable pool
+     */
+    static RWLockPool s_lockPool;
+
+protected:
+    Lockable* m_partyLock;               // Protect party pointer
+    RefPointer<SIPParty> m_party;
 };
 
 /**
@@ -153,7 +430,7 @@ private:
  * can be used to create a text buffer from a sip message.
  * @short A container and parser for SIP messages
  */
-class YSIP_API SIPMessage : public RefObject
+class YSIP_API SIPMessage : public RefObject, public SIPPartyHolder
 {
 public:
     /**
@@ -236,7 +513,8 @@ public:
      * @param dlgTag Value of dialog tag parameter to set in To header
      * @param flags Miscellaneous completion flags, -1 to take them from engine
      */
-    void complete(SIPEngine* engine, const char* user = 0, const char* domain = 0, const char* dlgTag = 0, int flags = -1);
+    void complete(SIPEngine* engine, const char* user = 0, const char* domain = 0,
+	const char* dlgTag = 0, int flags = -1);
 
     /**
      * Copy an entire header line (including all parameters) from another message
@@ -255,19 +533,6 @@ public:
      * @return Number of headers found and copied
      */
     int copyAllHeaders(const SIPMessage* message, const char* name, const char* newName = 0);
-
-    /**
-     * Get the endpoint this message uses
-     * @return Pointer to the endpoint of this message
-     */
-    inline SIPParty* getParty() const
-	{ return m_ep; }
-
-    /**
-     * Set the endpoint this message uses
-     * @param ep Pointer to the endpoint of this message
-     */
-    void setParty(SIPParty* ep = 0);
 
     /**
      * Check if this message is valid as result of the parsing
@@ -299,8 +564,10 @@ public:
      * Check if this message is handled by a reliable protocol
      * @return True if a reliable protocol (TCP, SCTP) is used
      */
-    inline bool isReliable() const
-	{ return m_ep ? m_ep->isReliable() : false; }
+    inline bool isReliable() const {
+	    RefPointer<SIPParty> party;
+	    return getParty(party) && party->isReliable();
+	}
 
     /**
      * Get the Command Sequence number from this message
@@ -499,7 +766,7 @@ public:
      * @return The trace ID
      */
     const String& traceId() const 
-        { return msgTraceId; }
+	{ return msgTraceId; }
 
     /**
      * Sip Version
@@ -550,7 +817,6 @@ public:
 protected:
     bool parse(const char* buf, int len, unsigned int* bodyLen);
     bool parseFirst(String& line);
-    SIPParty* m_ep;
     RefPointer<SIPSequence> m_seq;
     bool m_valid;
     bool m_answer;
@@ -827,9 +1093,10 @@ public:
      * @param engine A pointer to the SIP engine this transaction belongs
      * @param outgoing True if this transaction is for an outgoing request
      * @param autoChangeParty Optional pointer to auto change party flag (use engine's flag if missing)
+     * @param params Optional transaction parameters
      */
     SIPTransaction(SIPMessage* message, SIPEngine* engine, bool outgoing = true,
-	bool* autoChangeParty = 0);
+	bool* autoChangeParty = 0, const NamedList* params = 0);
 
     /**
      * Copy constructor to be used with forked INVITEs
@@ -981,6 +1248,13 @@ public:
     void setTransCount(int count);
 
     /**
+     * Check if 100 Trying is automatically sent to incoming INVITE
+     * @return True 100 Trying is automatically sent to incoming INVITE
+     */
+    inline bool autoTrying() const
+	{ return m_autoTrying; }
+
+    /**
      * Get the automatic UAC 2xx ACK generation flag
      * @return True if an ACK will be generated automatically for 2xx answers
      */
@@ -1051,14 +1325,17 @@ public:
      * Creates and transmits a final response message
      * @param code Response code to send
      * @param reason Human readable reason text (optional)
+     * @param replace Replace existing response
      * @return True if the message was queued for transmission
      */
-    bool setResponse(int code, const char* reason = 0);
+    bool setResponse(int code, const char* reason = 0, bool replace = true);
 
     /**
-     * Transmits a final response message
+     * Transmits a response message
+     * @param message Message to be sent
+     * @param replace Replace existing response
      */
-    void setResponse(SIPMessage* message);
+    void setResponse(SIPMessage* message, bool replace = true);
 
     /**
      * Retrieve the latest response code
@@ -1102,7 +1379,7 @@ public:
      * @return Trace ID associated with this transaction
      */
     const String& traceId() const
-        { return m_traceId; }
+	{ return m_traceId; }
 
 protected:
     /**
@@ -1212,6 +1489,7 @@ protected:
     bool m_autoChangeParty;
     bool m_autoAck;
     bool m_silent;
+    bool m_autoTrying;                   // Send 100 to incoming INVITE
     String m_traceId;
 };
 
@@ -1268,10 +1546,19 @@ public:
 	{ return m_message && !m_message->isOutgoing(); }
 
     /**
-     * Get the pointer to the endpoint this event uses
+     * Retrieve the SIP party this event uses
+     * @param party Destination for held party (reference)
+     * @return SIPParty pointer, NULL if not set
      */
-    inline SIPParty* getParty() const
-	{ return m_message ? m_message->getParty() : 0; }
+    inline SIPParty* getParty(RefPointer<SIPParty>& party)
+	{ return m_message ? m_message->getParty(party) : (SIPParty*)party; }
+
+    /**
+     * Check if this event's message is handled by a reliable protocol
+     * @return True if a reliable protocol (TCP, SCTP) is used
+     */
+    inline bool isReliable() const
+	{ return m_message && m_message->isReliable(); }
 
     /**
      * Return the opaque user data stored in the transaction
@@ -1297,7 +1584,18 @@ public:
      * @return The trace ID, it can be empty.
      */
     inline const String& traceId() const
-        { return m_transaction ? m_transaction->traceId() : String::empty(); }
+	{ return m_transaction ? m_transaction->traceId() : String::empty(); }
+
+    /**
+     * Release (destruct) an event. Reset the pointer
+     * @param e Event to release
+     */
+    static inline void release(SIPEvent*& e) {
+	    if (!e)
+		return;
+	    delete e;
+	    e = 0;
+	}
 
 protected:
     SIPMessage* m_message;
@@ -1357,7 +1655,7 @@ public:
      */
     virtual bool checkUser(String& username, const String& realm, const String& nonce,
 	const String& method, const String& uri, const String& response,
-	const SIPMessage* message, const MimeHeaderLine* authLine, GenObject* userData);
+	SIPMessage* message, const MimeHeaderLine* authLine, GenObject* userData);
 
     /**
      * Authenticate a message by other means than user credentials. By default
@@ -1369,7 +1667,7 @@ public:
      * @param userData Pointer to an optional object passed from @ref authUser
      * @return True if message is authenticated, false if verification failed
      */
-    virtual bool checkAuth(bool noUser, String& username, const SIPMessage* message,
+    virtual bool checkAuth(bool noUser, String& username, SIPMessage* message,
 	const MimeHeaderLine* authLine, GenObject* userData);
 
     /**
@@ -1381,7 +1679,7 @@ public:
      * @param userData Pointer to an optional object that is passed back to @ref checkUser
      * @return Age of the nonce if user matches, negative for a failure
      */
-    int authUser(const SIPMessage* message, String& user, bool proxy = false, GenObject* userData = 0);
+    int authUser(SIPMessage* message, String& user, bool proxy = false, GenObject* userData = 0);
 
     /**
      * Add a message into the transaction list
@@ -1397,9 +1695,11 @@ public:
      * This method is thread safe
      * @param message A parsed SIP message to add to the transactions
      * @param autoChangeParty Optional auto change party to set in transaction if a new one is created
+     * @param params Optional transaction parameters
      * @return Pointer to the transaction or NULL if message was invalid
      */
-    SIPTransaction* addMessage(SIPMessage* message, bool* autoChangeParty = 0);
+    SIPTransaction* addMessage(SIPMessage* message, bool* autoChangeParty = 0,
+	const NamedList* params = 0);
 
     /**
      * Get a SIPEvent from the queue.

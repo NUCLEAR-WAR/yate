@@ -33,7 +33,7 @@ SIPMessage::SIPMessage(const SIPMessage& original)
     : RefObject(),
       version(original.version), method(original.method), uri(original.uri),
       code(original.code), reason(original.reason),
-      body(0), msgTraceId(original.msgTraceId), msgPrint(true), m_ep(0),
+      body(0), msgTraceId(original.msgTraceId), msgPrint(true),
       m_valid(original.isValid()), m_answer(original.isAnswer()),
       m_outgoing(original.isOutgoing()), m_ack(original.isACK()),
       m_cseq(-1), m_flags(original.getFlags()), m_dontSend(original.m_dontSend)
@@ -42,7 +42,7 @@ SIPMessage::SIPMessage(const SIPMessage& original)
 	&original,this);
     if (original.body)
 	setBody(original.body->clone());
-    setParty(original.getParty());
+    setParty(original);
     setSequence(original.getSequence());
     bool via1 = true;
     const ObjList* l = &original.header;
@@ -65,7 +65,7 @@ SIPMessage::SIPMessage(const SIPMessage& original)
 
 SIPMessage::SIPMessage(const char* _method, const char* _uri, const char* _version)
     : version(_version), method(_method), uri(_uri), code(0),
-      body(0), msgPrint(true), m_ep(0), m_valid(true),
+      body(0), msgPrint(true), m_valid(true),
       m_answer(false), m_outgoing(true), m_ack(false), m_cseq(-1), m_flags(-1),
       m_dontSend(false)
 {
@@ -74,14 +74,13 @@ SIPMessage::SIPMessage(const char* _method, const char* _uri, const char* _versi
 }
 
 SIPMessage::SIPMessage(SIPParty* ep, const char* buf, int len, unsigned int* bodyLen)
-    : code(0), body(0), msgPrint(true), m_ep(ep), m_valid(false),
+    : SIPPartyHolder(ep),
+      code(0), body(0), msgPrint(true), m_valid(false),
       m_answer(false), m_outgoing(false), m_ack(false), m_cseq(-1), m_flags(-1),
       m_dontSend(false)
 {
     DDebug(DebugInfo,"SIPMessage::SIPMessage(%p,%d) [%p]\r\n------\r\n%s------",
 	buf,len,this,buf);
-    if (m_ep)
-	m_ep->ref();
     if (!(buf && *buf)) {
 	TraceDebug(msgTraceId,DebugWarn,"Empty message text in [%p]",this);
 	return;
@@ -93,7 +92,7 @@ SIPMessage::SIPMessage(SIPParty* ep, const char* buf, int len, unsigned int* bod
 
 SIPMessage::SIPMessage(const SIPMessage* message, int _code, const char* _reason)
     : code(_code), body(0), msgPrint(true),
-      m_ep(0), m_valid(false),
+      m_valid(false),
       m_answer(true), m_outgoing(true), m_ack(false), m_cseq(-1), m_flags(-1),
       m_dontSend(false)
 {
@@ -105,9 +104,7 @@ SIPMessage::SIPMessage(const SIPMessage* message, int _code, const char* _reason
     if (!(message && message->isValid()))
 	return;
     m_flags = message->getFlags();
-    m_ep = message->getParty();
-    if (m_ep)
-	m_ep->ref();
+    setParty(*message);
     version = message->version;
     uri = message->uri;
     method = message->method;
@@ -124,7 +121,7 @@ SIPMessage::SIPMessage(const SIPMessage* message, int _code, const char* _reason
 
 SIPMessage::SIPMessage(const SIPMessage* original, const SIPMessage* answer)
     : method("ACK"), code(0),
-      body(0), msgPrint(true), m_ep(0), m_valid(false),
+      body(0), msgPrint(true), m_valid(false),
       m_answer(false), m_outgoing(true), m_ack(true), m_cseq(-1), m_flags(-1),
       m_dontSend(false)
 {
@@ -132,9 +129,7 @@ SIPMessage::SIPMessage(const SIPMessage* original, const SIPMessage* answer)
     if (!(original && original->isValid()))
 	return;
     m_flags = original->getFlags();
-    m_ep = original->getParty();
-    if (m_ep)
-	m_ep->ref();
+    setParty(*original);
     version = original->version;
     uri = original->uri;
     msgTraceId = original->msgTraceId;
@@ -142,10 +137,11 @@ SIPMessage::SIPMessage(const SIPMessage* original, const SIPMessage* answer)
     MimeHeaderLine* hl = const_cast<MimeHeaderLine*>(getHeader("Via"));
     if (!hl) {
 	String tmp;
-	tmp << version << "/" << getParty()->getProtoName();
-	if (getParty()) {
-	    tmp << " ";
-	    getParty()->appendAddr(tmp,true);
+	tmp << version << "/";
+	RefPointer<SIPParty> p;
+	if (getParty(p)) {
+	    tmp << p->getProtoName() << " ";
+	    p->appendAddr(tmp,true);
 	}
 	hl = new MimeHeaderLine("Via",tmp);
 	header.append(hl);
@@ -192,7 +188,8 @@ SIPMessage::~SIPMessage()
     setBody();
 }
 
-void SIPMessage::complete(SIPEngine* engine, const char* user, const char* domain, const char* dlgTag, int flags)
+void SIPMessage::complete(SIPEngine* engine, const char* user, const char* domain,
+    const char* dlgTag, int flags)
 {
     DDebug(engine,DebugAll,"SIPMessage::complete(%p,'%s','%s','%s',%d)%s%s%s [%p]",
 	engine,user,domain,dlgTag,flags,
@@ -212,16 +209,19 @@ void SIPMessage::complete(SIPEngine* engine, const char* user, const char* domai
     if (!isOutgoing())
 	return;
 
-    if (!getParty()) {
+    RefPointer<SIPParty> party;
+    if (!getParty(party)) {
 	engine->buildParty(this);
-	if (!getParty()) {
+	if (!getParty(party)) {
 	    TraceDebug(msgTraceId,engine,DebugCrit,"Could not complete party-less SIP message [%p]",this);
 	    return;
 	}
     }
-    String partyLAddr;
-    int partyLPort = 0;
-    getParty()->getAddr(partyLAddr,partyLPort,true);
+    Lock lckParty(party->lock(),-1,true);
+    String partyLAddr = party->getLocalAddr();
+    int partyLPort = party->getLocalPort();
+    String partyVia = party->getVia();
+    lckParty.drop();
 
     // only set the dialog tag on ACK
     if (isACK()) {
@@ -243,9 +243,11 @@ void SIPMessage::complete(SIPEngine* engine, const char* user, const char* domai
     MimeHeaderLine* hl = const_cast<MimeHeaderLine*>(getHeader("Via"));
     if (!hl) {
 	String tmp;
-	tmp << version << "/" << getParty()->getProtoName();
-	tmp << " ";
-	SocketAddr::appendTo(tmp,partyLAddr,partyLPort);
+	tmp << version << "/" << party->getProtoName() << " ";
+	if (partyVia)
+	    tmp << partyVia;
+	else
+	    SocketAddr::appendTo(tmp,partyLAddr,partyLPort);
 	hl = new MimeHeaderLine("Via",tmp);
 	if (isReliable() && 0 == (flags & NoConnReuse))
 	    hl->setParam("alias");
@@ -260,12 +262,12 @@ void SIPMessage::complete(SIPEngine* engine, const char* user, const char* domai
     }
     if (isAnswer()) {
 	if (!(flags & NotSetReceived)) {
-	    Lock lck(getParty()->lock(),-1,true);
-	    hl->setParam("received",getParty()->getPartyAddr());
+	    Lock lck(party->lock(),-1,true);
+	    hl->setParam("received",party->getPartyAddr());
 	}
 	const String* rport = hl->getParam("rport");
 	if (rport && rport->null() && !(flags & NotSetRport))
-	    const_cast<String&>(*rport) = getParty()->getPartyPort();
+	    const_cast<String&>(*rport) = party->getPartyPort();
     }
     else if ((flags & RportAfterBranch) && !((flags & NotReqRport) || isACK() || hl->getParam("rport")))
 	hl->setParam("rport");
@@ -667,18 +669,6 @@ void SIPMessage::setBody(MimeBody* newbody)
 	return;
     TelEngine::destruct(body);
     body = newbody;
-}
-
-void SIPMessage::setParty(SIPParty* ep)
-{
-    if (ep == m_ep)
-	return;
-    if (ep && !ep->ref())
-	ep = 0;
-    XDebug(DebugAll,"SIPMessage::setParty(%p) current=%p [%p]",ep,m_ep,this);
-    SIPParty* tmp = m_ep;
-    m_ep = ep;
-    TelEngine::destruct(tmp);
 }
 
 MimeAuthLine* SIPMessage::buildAuth(const String& username, const String& password,

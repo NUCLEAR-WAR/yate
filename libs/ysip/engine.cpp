@@ -110,6 +110,10 @@ static TokenDict sip_responses[] = {
 
 TokenDict* TelEngine::SIPResponses = sip_responses;
 
+
+//
+// SIPParty
+//
 SIPParty::SIPParty(RWLock* lck)
     : m_lock(lck), m_reliable(false), m_localPort(0), m_partyPort(0)
 {
@@ -137,6 +141,24 @@ void SIPParty::setAddr(const String& addr, int port, bool local)
     DDebug(DebugAll,"SIPParty updated %s address '%s' [%p]",
 	local ? "local" : "remote",SocketAddr::appendTo(a,p).c_str(),this);
 }
+
+String& SIPParty::describe(String& buf, bool transPtr, bool unsafe)
+{
+    Lock lck(unsafe ? m_lock : 0,-1,true);
+    String l, r, t;
+    SocketAddr::appendTo(l,m_local,m_localPort);
+    SocketAddr::appendTo(r,m_party,m_partyPort);
+    lck.drop();
+    if (transPtr)
+        t.printf(" trans=(%p)",getTransport());
+    return buf.printfAppend("local=%s remote=%s%s %s",l.safe(),r.safe(),t.safe(),TelEngine::c_safe(getProtoName()));
+}
+
+
+//
+// SIPPartyHolder
+//
+RWLockPool SIPPartyHolder::s_lockPool(101,"SIPPartyHolder");
 
 
 SIPEvent::SIPEvent(SIPMessage* message, SIPTransaction* transaction)
@@ -200,7 +222,8 @@ SIPTransaction* SIPEngine::addMessage(SIPParty* ep, const char* buf, int len)
     return 0;
 }
 
-SIPTransaction* SIPEngine::addMessage(SIPMessage* message, bool* autoChangeParty)
+SIPTransaction* SIPEngine::addMessage(SIPMessage* message, bool* autoChangeParty,
+    const NamedList* params)
 {
     DDebug(this,DebugInfo,"addMessage(%p) [%p]",message,this);
     if (!message)
@@ -250,7 +273,7 @@ SIPTransaction* SIPEngine::addMessage(SIPMessage* message, bool* autoChangeParty
 	return 0;
     }
     message->complete(this);
-    return new SIPTransaction(message,this,message->isOutgoing(),autoChangeParty);
+    return new SIPTransaction(message,this,message->isOutgoing(),autoChangeParty,params);
 }
 
 SIPTransaction* SIPEngine::forkInvite(SIPMessage* answer, SIPTransaction* trans)
@@ -324,10 +347,12 @@ void SIPEngine::processEvent(SIPEvent *event)
 		case SIPTransaction::Cleared:
 		    if (!event->getMessage()->isAnswer())
 			break;
-		default:
-		    if (event->getParty() && !event->getParty()->transmit(event) &&
+		default: {
+		    RefPointer<SIPParty> party;
+		    if (event->getParty(party) && !party->transmit(event) &&
 			event->getTransaction())
 			event->getTransaction()->msgTransmitFailed(event->getMessage());
+		}
 	    }
 	}
 	if (event->isIncoming()) {
@@ -339,7 +364,7 @@ void SIPEngine::processEvent(SIPEvent *event)
 	    }
 	}
     }
-    delete event;
+    SIPEvent::release(event);
 }
 
 u_int64_t SIPEngine::getUserTimeout() const
@@ -457,12 +482,12 @@ void SIPEngine::ncGet(String& nc)
 
 bool SIPEngine::checkUser(String& username, const String& realm, const String& nonce,
     const String& method, const String& uri, const String& response,
-    const SIPMessage* message, const MimeHeaderLine* authLine, GenObject* userData)
+    SIPMessage* message, const MimeHeaderLine* authLine, GenObject* userData)
 {
     return false;
 }
 
-bool SIPEngine::checkAuth(bool noUser, String& username, const SIPMessage* message,
+bool SIPEngine::checkAuth(bool noUser, String& username, SIPMessage* message,
     const MimeHeaderLine* authLine, GenObject* userData)
 {
     return message && noUser && checkUser(username,"","",message->method,message->uri,"",message,authLine,userData);
@@ -503,7 +528,7 @@ void SIPEngine::buildAuth(const String& hash_a1, const String& nonce, const Stri
     response = md5.hexDigest();
 }
 
-int SIPEngine::authUser(const SIPMessage* message, String& user, bool proxy, GenObject* userData)
+int SIPEngine::authUser(SIPMessage* message, String& user, bool proxy, GenObject* userData)
 {
     if (!message)
 	return -1;

@@ -329,6 +329,7 @@
 ;  (and subsequent transactions) will be sent to 1.2.3.4:5080
 ; Defaults to disable
 ; This parameter is applied on reload
+; This parameter can be overridden in listener sections
 ;autochangeparty=disable
 
 ; change_party_2xx: bool: Change party when handling 2xx response to INVITE
@@ -731,3 +732,6 @@
 ; capture_compress: boolean. Set to true to compress captured packets.
 ; If not set, it will use the HEP server configuration 'compress' configured value
 ;capture_compress=false
+
+; auto_trying: boolean: Automatically send 100 Trying to incoming INVITE requests
+;auto_trying=yes
