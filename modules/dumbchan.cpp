@@ -45,8 +45,7 @@ public:
       Channel(__plugin, 0, outgoing)
     {
 	m_address = addr;
-	if (outgoing)
-	    setChanParams(exeMsg);
+	setChanParams(exeMsg,!outgoing);
 	Message* s = message("chan.startup",exeMsg);
 	if (outgoing)
 	    s->copyParams(exeMsg,"caller,callername,called,billid,callto,username");
