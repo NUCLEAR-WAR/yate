@@ -7921,10 +7921,13 @@ YateSIPConnection::YateSIPConnection(Message& msg, const String& uri, const char
     // Force party creation: this will force used protocol to TLS
     if (!m_party && sips() && !haveTransParams(msg,"o"))
 	setParty(msg,true,"o",m_uri.getHost(),m_uri.getPort(),true);
-    SIPMessage* m = new SIPMessage("INVITE",m_uri);
-    m->dontSend(m_stopOCall);
-    m->msgTraceId = m_traceId;
-    setSipParty(m,line,true,msg.getValue("host"),msg.getIntValue("port"));
+	SIPMessage* m = new SIPMessage("INVITE",m_uri);
+	m->dontSend(m_stopOCall);
+	m->msgTraceId = m_traceId;
+	
+	// The RFC 3263 resolver needs Route before setSipParty() selects the next hop.
+	copySipHeaders(*m,msg);
+	setSipParty(m,line,true,msg.getValue("host"),msg.getIntValue("port"));
     RefPointer<SIPParty> party;
     if (!m->getParty(party)) {
 	String tmp;
@@ -7946,7 +7949,7 @@ YateSIPConnection::YateSIPConnection(Message& msg, const String& uri, const char
     updateRtpNatAddress(&msg);
     int maxf = msg.getIntValue(YSTRING("antiloop"),s_maxForwards);
     m->addHeader("Max-Forwards",String(maxf));
-    copySipHeaders(*m,msg);
+    // copySipHeaders(*m,msg);
     m_domain = msg.getValue(YSTRING("domain"));
     const String* callerId = msg.getParam(YSTRING("caller"));
     String caller;
