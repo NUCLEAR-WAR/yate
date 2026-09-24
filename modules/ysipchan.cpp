@@ -1574,8 +1574,6 @@ static bool s_printMsg = true;           // Print sent/received SIP messages to 
 static ObjList* s_authCopyHeader = 0;    // Copy headers in user.auth
 
 static bool s_ipv6 = false;              // IPv6 support enabled
-static bool s_ipv6 = false;              // IPv6 support enabled
-
 /*
  * RFC 3263 SIP server discovery.
  *
