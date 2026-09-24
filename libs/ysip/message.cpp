@@ -128,10 +128,26 @@ SIPMessage::SIPMessage(const SIPMessage* original, const SIPMessage* answer)
     DDebug(DebugAll,"SIPMessage::SIPMessage(%p,%p) [%p]",original,answer,this);
     if (!(original && original->isValid()))
 	return;
-    m_flags = original->getFlags();
-    setParty(*original);
-    version = original->version;
-    uri = original->uri;
+	m_flags = original->getFlags();
+	
+	/*
+	 * For ACK to non-2xx, the ACK belongs to the INVITE
+	 * transaction and may use the original transaction peer.
+	 *
+	 * For ACK to 2xx, this is a new transaction inside the
+	 * established dialog. Its next hop must be derived from
+	 * the dialog route set / remote target.
+	 *
+	 * Do not inherit the original INVITE's SIPParty.
+	 */
+	if (!(answer &&
+	      ((answer->code / 100) == 2) &&
+	      (original->method &= "INVITE"))) {
+	    setParty(*original);
+	}
+	
+	version = original->version;
+	uri = original->uri;
     msgTraceId = original->msgTraceId;
     copyAllHeaders(original,"Via");
     MimeHeaderLine* hl = const_cast<MimeHeaderLine*>(getHeader("Via"));
