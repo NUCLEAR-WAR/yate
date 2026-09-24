@@ -1574,6 +1574,19 @@ static bool s_printMsg = true;           // Print sent/received SIP messages to 
 static ObjList* s_authCopyHeader = 0;    // Copy headers in user.auth
 
 static bool s_ipv6 = false;              // IPv6 support enabled
+static bool s_ipv6 = false;              // IPv6 support enabled
+
+/*
+ * RFC 3263 SIP server discovery.
+ *
+ * Disabled by default so existing Yate installations keep
+ * their original routing behaviour unless explicitly enabled.
+ */
+static bool s_rfc3263 = false;
+static bool s_rfc3263Naptr = true;
+static bool s_rfc3263Srv = true;
+static bool s_rfc3263Ipv6 = false;
+
 static u_int64_t s_waitActiveUdpTrans = 1000000; // Time to wait for active UDP transactions
                                                  // to complete when a listener is disabled
 static unsigned int s_tcpConnectRetry = 3; // Number of TCP connect attempts
@@ -10605,13 +10618,39 @@ void SIPDriver::initialize()
     s_update_target = s_cfg.getBoolValue("general","update_target",false);
     s_update_verify = s_cfg.getBoolValue("general","update_verify",false);
     s_preventive_bye = s_cfg.getBoolValue("general","preventive_bye",true);
-    s_ignoreVia = s_cfg.getBoolValue("general","ignorevia",true);
-    s_ipv6 = s_cfg.getBoolValue("general","ipv6_support",false);
-    if (s_ipv6 && !SocketAddr::supports(SocketAddr::IPv6)) {
-	Debug(this,DebugConf,"Ignoring IPv6 support enable: not supported");
-	s_ipv6 = false;
-    }
-    s_printMsg = s_cfg.getBoolValue("general","printmsg",true);
+	s_ignoreVia = s_cfg.getBoolValue("general","ignorevia",true);
+	
+	s_ipv6 = s_cfg.getBoolValue("general","ipv6_support",false);
+	if (s_ipv6 && !SocketAddr::supports(SocketAddr::IPv6)) {
+	    Debug(this,DebugConf,"Ignoring IPv6 support enable: not supported");
+	    s_ipv6 = false;
+	}
+	
+	/*
+	 * RFC 3263 SIP server discovery.
+	 *
+	 * Disabled by default to preserve existing Yate behaviour.
+	 */
+	s_rfc3263 = s_cfg.getBoolValue(
+	    "general","rfc3263",false);
+	
+	s_rfc3263Naptr = s_cfg.getBoolValue(
+	    "general","rfc3263_naptr",true);
+	
+	s_rfc3263Srv = s_cfg.getBoolValue(
+	    "general","rfc3263_srv",true);
+	
+	s_rfc3263Ipv6 = s_cfg.getBoolValue(
+	    "general","rfc3263_ipv6",false);
+	
+	Debug(this,DebugInfo,
+	    "RFC3263 discovery enabled=%s NAPTR=%s SRV=%s IPv6=%s",
+	    String::boolText(s_rfc3263),
+	    String::boolText(s_rfc3263Naptr),
+	    String::boolText(s_rfc3263Srv),
+	    String::boolText(s_rfc3263Ipv6));
+	
+	s_printMsg = s_cfg.getBoolValue("general","printmsg",true);
     s_tcpMaxpkt = getMaxpkt(s_cfg.getIntValue("general","tcp_maxpkt",4096),4096);
     s_lineKeepTcpOffline = s_cfg.getBoolValue("general","line_keeptcpoffline",!Engine::clientMode());
     s_defEncoding = s_cfg.getIntValue("general","body_encoding",SipHandler::s_bodyEnc,SipHandler::BodyBase64);
