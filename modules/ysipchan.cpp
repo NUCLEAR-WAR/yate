@@ -7386,17 +7386,44 @@ SIPMessage* YateSIPConnection::createDlgMsg(const char* method, const char* uri)
 	uri = m_uri;
     SIPMessage* m = new SIPMessage(method,uri);
     m->msgTraceId = m_traceId;
-    if (m_routes) {
-	Lock lck(driver());
-	m->addRoutes(m_routes);
-    }
-    setSipParty(m,plugin.findLine(m_line),true,m_host,m_port);
-    if (!m->haveParty()) {
-	TraceDebug(m_traceId,this,DebugWarn,"Could not create party for '%s' [%p]",
-	    SocketAddr::appendTo(m_host,m_port).c_str(),this);
-	m->destruct();
-	return 0;
-    }
+	if (m_routes) {
+	    Lock lck(driver());
+	    m->addRoutes(m_routes);
+	}
+	
+	if (m->getHeader("Route")) {
+	    /*
+	     * Dialog has a route set.
+	     * buildParty() will use the top Route as next hop.
+	     */
+	    plugin.ep()->buildParty(m);
+	}
+	else {
+	    /*
+	     * No route set: remote target is the next hop.
+	     */
+	    setSipParty(
+	        m,
+	        plugin.findLine(m_line),
+	        true,
+	        m_host,
+	        m_port
+	    );
+	}
+	
+	if (!m->haveParty()) {
+	    TraceDebug(
+	        m_traceId,
+	        this,
+	        DebugWarn,
+	        "Could not create party for '%s' [%p]",
+	        SocketAddr::appendTo(m_host,m_port).c_str(),
+	        this
+	    );
+	
+	    m->destruct();
+	    return 0;
+	}
     if (m_dialog.getLastCSeq() < 0)
 	m_dialog.setCSeq(plugin.ep()->engine()->getNextCSeq() - 1);
     m->setSequence(m_dialog.getSequence());
