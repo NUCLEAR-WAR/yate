@@ -5662,26 +5662,34 @@ static bool getSipNextHopUri(const SIPMessage* msg,
 
 /*
  * ================================================================
- * RFC 3263 UDP SIP DNS discovery
+ * RFC 3263 SIP DNS discovery
  * ================================================================
  *
- * Initial implementation:
+ * Supported discovery:
  *
  *      SIP domain
  *          |
- *          +-- NAPTR SIP+D2U
+ *          +-- NAPTR SIP+D2T / SIP+D2U
  *          |
- *          +-- SRV _sip._udp
+ *          +-- SRV _sip._tcp / _sip._udp
  *          |
- *          +-- A
+ *          +-- A/AAAA fallback
  *
- * This is deliberately UDP-only for the first implementation.
+ * Transport policy:
  *
- * It is used only when:
+ *      NAPTR Order
+ *          |
+ *          +-- NAPTR Preference
+ *                  |
+ *                  +-- equal TCP/UDP -> prefer TCP
+ *
+ * If no usable NAPTR exists, TCP SRV is attempted before UDP SRV.
+ *
+ * Discovery is used only when:
  *
  *      s_rfc3263 == true
  *
- * and the SIP URI contains no explicit port.
+ * and the effective SIP next-hop URI contains no explicit port.
  *
  * Existing Yate behaviour remains unchanged otherwise.
  * ================================================================
@@ -5768,10 +5776,16 @@ static bool sipDnsExpandName(const unsigned char* packet,
 
 
 /*
- * Query one SIP+D2U NAPTR record.
+ * Query SIP NAPTR records.
  *
- * For this first implementation we select the lowest
- * order/preference SIP+D2U record.
+ * Supported services:
+ *
+ *     SIP+D2T -> TCP
+ *     SIP+D2U -> UDP
+ *
+ * Lowest Order wins, then lowest Preference.
+ * If TCP and UDP have identical Order and Preference,
+ * TCP is preferred by local policy.
  */
 static bool sipDnsNaptr(const String& domain,
     SipDnsNaptrResult& selected)
@@ -6071,17 +6085,19 @@ static bool sipDnsSrv(const String& name,
 
 
 /*
- * Resolve:
+ * Resolve SIP domain using:
  *
- *      SIP domain
- *          ↓
- *      NAPTR SIP+D2U
- *          ↓
- *      SRV
+ *     NAPTR
+ *       -> selected transport
+ *       -> SRV
  *
- * We deliberately leave the final A lookup to SocketAddr.
+ * If no usable NAPTR exists:
  *
- * This avoids duplicating Yate's existing IPv4 host resolver.
+ *     _sip._tcp
+ *       -> _sip._udp
+ *       -> host / UDP 5060
+ *
+ * Final A/AAAA resolution is left to Yate's SocketAddr resolver.
  */
 static bool sipResolve3263(const String& domain,
     String& host, int& port, int& transport)
@@ -6143,75 +6159,67 @@ static bool sipResolve3263(const String& domain,
      * ------------------------------------------------------------
      */
 
-    if (s_rfc3263Srv) {
-
-        SipDnsSrvResult tcpSrv;
-        SipDnsSrvResult udpSrv;
-
-        String tcpName("_sip._tcp.");
-        tcpName += domain;
-
-        String udpName("_sip._udp.");
-        udpName += domain;
-
-        bool haveTcp = sipDnsSrv(tcpName,tcpSrv);
-        bool haveUdp = sipDnsSrv(udpName,udpSrv);
-
-        if (haveTcp || haveUdp) {
-
-            /*
-             * Only TCP exists.
-             */
-            if (haveTcp && !haveUdp) {
-                host = tcpSrv.target;
-                port = tcpSrv.port;
-                transport = ProtocolHolder::Tcp;
-            }
-
-            /*
-             * Only UDP exists.
-             */
-            else if (!haveTcp && haveUdp) {
-                host = udpSrv.target;
-                port = udpSrv.port;
-                transport = ProtocolHolder::Udp;
-            }
-
-            /*
-             * Both exist.
-             *
-             * Compare SRV priority.
-             * Lower value wins.
-             *
-             * Equal priority -> prefer TCP.
-             */
-            else if (tcpSrv.priority <= udpSrv.priority) {
-                host = tcpSrv.target;
-                port = tcpSrv.port;
-                transport = ProtocolHolder::Tcp;
-            }
-            else {
-                host = udpSrv.target;
-                port = udpSrv.port;
-                transport = ProtocolHolder::Udp;
-            }
-
-            Debug(
-                &plugin,
-                DebugInfo,
-                "RFC3263 resolved '%s' -> %s:%s:%d via SRV",
-                domain.c_str(),
-                ProtocolHolder::lookupProtoName(
-                    transport,
-                    false
-                ),
-                host.c_str(),
-                port
-            );
-
-            return true;
-        }
-    }
+	if (s_rfc3263Srv) {
+	
+	    /*
+	     * No usable NAPTR.
+	     *
+	     * Local transport preference:
+	     *
+	     *     1. TCP
+	     *     2. UDP
+	     *
+	     * Do not compare SRV priorities between _sip._tcp and
+	     * _sip._udp. SRV priority applies within an SRV RRset,
+	     * not between transport services.
+	     */
+	
+	    SipDnsSrvResult srv;
+	
+	    String srvName("_sip._tcp.");
+	    srvName += domain;
+	
+	    if (sipDnsSrv(srvName,srv)) {
+	
+	        host = srv.target;
+	        port = srv.port;
+	        transport = ProtocolHolder::Tcp;
+	
+	        Debug(
+	            &plugin,
+	            DebugInfo,
+	            "RFC3263 resolved '%s' -> tcp:%s:%d "
+	            "via SRV fallback",
+	            domain.c_str(),
+	            host.c_str(),
+	            port
+	        );
+	
+	        return true;
+	    }
+	
+	    srvName = "_sip._udp.";
+	    srvName += domain;
+	
+	    if (sipDnsSrv(srvName,srv)) {
+	
+	        host = srv.target;
+	        port = srv.port;
+	        transport = ProtocolHolder::Udp;
+	
+	        Debug(
+	            &plugin,
+	            DebugInfo,
+	            "RFC3263 resolved '%s' -> udp:%s:%d "
+	            "via SRV fallback",
+	            domain.c_str(),
+	            host.c_str(),
+	            port
+	        );
+	
+	        return true;
+	    }
+	}
 
     /*
      * ------------------------------------------------------------
@@ -6326,21 +6334,21 @@ bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port
 			        resolvedPort,
 			        resolvedTransport)) {
 	
-	            Debug(
-	                &plugin,
-	                DebugInfo,
-	                "RFC3263 next hop "
-	                "URI='%s' domain='%s' "
-					"resolved='%s:%s:%d'",
-					ProtocolHolder::lookupProtoName(
-					    selectedTransport,
-					    false
-					),
-	                nextHopUri.c_str(),
-	                nextHopHost.c_str(),
-	                resolvedHost.c_str(),
-	                resolvedPort
-	            );
+					Debug(
+					    &plugin,
+					    DebugInfo,
+					    "RFC3263 next hop "
+					    "URI='%s' domain='%s' "
+					    "resolved='%s:%s:%d'",
+					    nextHopUri.c_str(),
+					    nextHopHost.c_str(),
+					    ProtocolHolder::lookupProtoName(
+					        resolvedTransport,
+					        false
+					    ),
+					    resolvedHost.c_str(),
+					    resolvedPort
+					);
 	
 	            nextHopHost = resolvedHost;
 	            port = resolvedPort;
