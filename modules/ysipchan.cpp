@@ -5574,6 +5574,79 @@ YateSIPEndPoint::~YateSIPEndPoint()
     plugin.epTerminated(this);
 }
 
+/*
+ * Extract a SIP URI from a Route header value.
+ *
+ * Examples:
+ *
+ *   <sip:scscf.example.net:6060;lr>
+ *       -> sip:scscf.example.net:6060;lr
+ *
+ *   sip:scscf.example.net:6060;lr
+ *       -> unchanged
+ */
+static bool getSipRouteUri(const MimeHeaderLine* hdr, String& value)
+{
+    value.clear();
+
+    if (!hdr)
+        return false;
+
+    value = *hdr;
+    value.trimBlanks();
+
+    if (!value)
+        return false;
+
+    static Regexp angled("^[^<]*<\\([^>]*\\)>.*$");
+
+    if (value.matches(angled))
+        value = value.matchString(1);
+
+    value.trimBlanks();
+
+    return value != String::empty();
+}
+
+
+/*
+ * Determine the effective SIP next-hop URI.
+ *
+ * RFC 3261:
+ *
+ *   Route present:
+ *       top Route URI is the next-hop routing URI
+ *
+ *   no Route:
+ *       Request-URI is the routing URI
+ *
+ * This function does NOT change the Request-URI.
+ */
+static bool getSipNextHopUri(const SIPMessage* msg,
+    String& value, bool& fromRoute)
+{
+    value.clear();
+    fromRoute = false;
+
+    if (!msg)
+        return false;
+
+    const MimeHeaderLine* route = msg->getHeader("Route");
+
+    if (route) {
+        if (!getSipRouteUri(route,value))
+            return false;
+
+        fromRoute = true;
+        return true;
+    }
+
+    value = msg->uri;
+    value.trimBlanks();
+
+    return value != String::empty();
+}
+
 bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port, const YateSIPLine* line)
 {
     if (message->isAnswer())
@@ -5592,73 +5665,65 @@ bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port
 	URI uri(message->uri);
 	
 	/*
-	 * Keep storage for the selected next-hop host alive for the
-	 * complete lifetime of this function.
+	 * Own storage for the selected host.
 	 *
-	 * Do not assign 'host' directly to String data owned by a
-	 * temporary URI object.
+	 * Do not point 'host' at data owned by a temporary URI.
 	 */
 	String nextHopHost;
 	
 	if (line) {
 	    if (!host)
 	        host = line->getPartyAddr();
+	
 	    if (port <= 0)
 	        port = line->getPartyPort();
+	
 	    line->setupAuth(message);
 	}
 	
+	
 	/*
-	 * RFC 3261 dialog routing.
+	 * A caller-supplied host is an explicit transport override.
 	 *
-	 * For a loose-routed request, the Request-URI remains the
-	 * remote target while the top Route URI determines the
-	 * network next hop.
+	 * This preserves current Yate behaviour for existing services.
 	 */
 	if (!host) {
-	    const MimeHeaderLine* route = message->getHeader("Route");
 	
-	    if (route) {
-	        String routeUri = *route;
+	    String nextHopUri;
+	    bool fromRoute = false;
 	
-	        static Regexp angled("^[^<]*<\\([^>]*\\)>.*$");
+	    if (!getSipNextHopUri(message,nextHopUri,fromRoute))
+	        return false;
 	
-	        if (routeUri.matches(angled))
-	            routeUri = routeUri.matchString(1);
+	    URI target(nextHopUri);
 	
-	        URI routeTarget(routeUri);
+	    nextHopHost = target.getHost();
 	
-	        /*
-	         * COPY the host.
-	         *
-	         * routeTarget is temporary, therefore we must not keep
-	         * a pointer to routeTarget.getHost().
-	         */
-	        nextHopHost = routeTarget.getHost();
+	    if (!nextHopHost) {
+	        Debug(
+	            &plugin,
+	            DebugWarn,
+	            "Invalid SIP next-hop URI '%s'",
+	            nextHopUri.c_str()
+	        );
 	
-	        if (nextHopHost) {
-	            host = nextHopHost.c_str();
-	
-	            if (port <= 0)
-	                port = routeTarget.getPort();
-	
-	            Debug(&plugin,DebugAll,
-	                "SIP loose-route next hop '%s:%d' from Route '%s'",
-	                host,port,routeUri.c_str());
-	        }
+	        return false;
 	    }
 	
-	    /*
-	     * No usable Route header:
-	     * use the Request-URI as the next hop.
-	     */
-	    if (!host) {
-	        nextHopHost = uri.getHost();
-	        host = nextHopHost.c_str();
+	    host = nextHopHost.c_str();
 	
-	        if (port <= 0)
-	            port = uri.getPort();
-	    }
+	    if (port <= 0)
+	        port = target.getPort();
+	
+	    Debug(
+	        &plugin,
+	        DebugAll,
+	        "SIP next hop URI='%s' host='%s' port=%d source=%s",
+	        nextHopUri.c_str(),
+	        host,
+	        port,
+	        fromRoute ? "Route" : "Request-URI"
+	    );
 	}
 	
 	if (port <= 0)
@@ -7390,50 +7455,57 @@ void YateSIPConnection::hangup()
 }
 
 // Creates a new message in an existing dialog
-SIPMessage* YateSIPConnection::createDlgMsg(const char* method, const char* uri)
+SIPMessage* YateSIPConnection::createDlgMsg(const char* method,
+    const char* uri)
 {
     if (!uri)
-	uri = m_uri;
+        uri = m_uri;
+
     SIPMessage* m = new SIPMessage(method,uri);
     m->msgTraceId = m_traceId;
-	if (m_routes) {
-	    Lock lck(driver());
-	    m->addRoutes(m_routes);
-	}
-	
-	if (m->getHeader("Route")) {
-	    /*
-	     * Dialog has a route set.
-	     * buildParty() will use the top Route as next hop.
-	     */
-	    plugin.ep()->buildParty(m);
-	}
-	else {
-	    /*
-	     * No route set: remote target is the next hop.
-	     */
-	    setSipParty(
-	        m,
-	        plugin.findLine(m_line),
-	        true,
-	        m_host,
-	        m_port
-	    );
-	}
-	
-	if (!m->haveParty()) {
-	    TraceDebug(
-	        m_traceId,
-	        this,
-	        DebugWarn,
-	        "Could not create party for '%s' [%p]",
-	        SocketAddr::appendTo(m_host,m_port).c_str(),
-	        this
-	    );
-	
-	    m->destruct();
-	    return 0;
-	}
+
+    if (m_routes) {
+        Lock lck(driver());
+        m->addRoutes(m_routes);
+    }
+
+    /*
+     * RFC 3261 dialog routing.
+     *
+     * If a route set exists, build the transport destination
+     * from the top Route URI.
+     *
+     * Otherwise the remote target is the next hop.
+     */
+    if (m->getHeader("Route")) {
+        plugin.ep()->buildParty(m);
+    }
+    else {
+        setSipParty(
+            m,
+            plugin.findLine(m_line),
+            true,
+            m_host,
+            m_port
+        );
+    }
+
+    if (!m->haveParty()) {
+        TraceDebug(
+            m_traceId,
+            this,
+            DebugWarn,
+            "Could not create SIP party for dialog request "
+            "method='%s' uri='%s' [%p]",
+            method,
+            uri,
+            this
+        );
+
+        m->destruct();
+        return 0;
+    }
+
     if (m_dialog.getLastCSeq() < 0)
 	m_dialog.setCSeq(plugin.ep()->engine()->getNextCSeq() - 1);
     m->setSequence(m_dialog.getSequence());
