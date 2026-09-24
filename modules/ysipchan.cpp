@@ -25,6 +25,10 @@
 
 #include <string.h>
 
+#ifdef HAVE_RESOLV_H
+#include <arpa/nameser.h>
+#include <resolv.h>
+#endif
 
 using namespace TelEngine;
 namespace { // anonymous
@@ -5658,6 +5662,490 @@ static bool getSipNextHopUri(const SIPMessage* msg,
     return value != String::empty();
 }
 
+/*
+ * ================================================================
+ * RFC 3263 UDP SIP DNS discovery
+ * ================================================================
+ *
+ * Initial implementation:
+ *
+ *      SIP domain
+ *          |
+ *          +-- NAPTR SIP+D2U
+ *          |
+ *          +-- SRV _sip._udp
+ *          |
+ *          +-- A
+ *
+ * This is deliberately UDP-only for the first implementation.
+ *
+ * It is used only when:
+ *
+ *      s_rfc3263 == true
+ *
+ * and the SIP URI contains no explicit port.
+ *
+ * Existing Yate behaviour remains unchanged otherwise.
+ * ================================================================
+ */
+
+struct SipDnsNaptrResult
+{
+    unsigned int order;
+    unsigned int preference;
+    String service;
+    String replacement;
+
+    SipDnsNaptrResult()
+        : order(0), preference(0)
+    {
+    }
+};
+
+
+struct SipDnsSrvResult
+{
+    unsigned int priority;
+    unsigned int weight;
+    unsigned int port;
+    String target;
+
+    SipDnsSrvResult()
+        : priority(0), weight(0), port(0)
+    {
+    }
+};
+
+
+/*
+ * Remove the trailing DNS dot:
+ *
+ *      host.example.org.
+ *
+ * becomes:
+ *
+ *      host.example.org
+ */
+static void sipDnsTrimDot(String& value)
+{
+    int len = value.length();
+
+    if (len && value[len - 1] == '.')
+        value = value.substr(0,len - 1);
+}
+
+
+/*
+ * Decode a compressed DNS domain name from a DNS response.
+ */
+static bool sipDnsExpandName(const unsigned char* packet,
+    int packetLen, const unsigned char* ptr, String& result)
+{
+    result.clear();
+
+    if (!packet || packetLen <= 0 || !ptr)
+        return false;
+
+    char name[NS_MAXDNAME];
+
+    int len = dn_expand(
+        packet,
+        packet + packetLen,
+        ptr,
+        name,
+        sizeof(name)
+    );
+
+    if (len < 0)
+        return false;
+
+    result = name;
+    sipDnsTrimDot(result);
+
+    return result != String::empty();
+}
+
+
+/*
+ * Query one SIP+D2U NAPTR record.
+ *
+ * For this first implementation we select the lowest
+ * order/preference SIP+D2U record.
+ */
+static bool sipDnsNaptrUdp(const String& domain,
+    SipDnsNaptrResult& selected)
+{
+    unsigned char answer[4096];
+
+    Debug(
+        &plugin,
+        DebugAll,
+        "RFC3263 NAPTR query '%s'",
+        domain.c_str()
+    );
+
+    int len = res_query(
+        domain.c_str(),
+        ns_c_in,
+        ns_t_naptr,
+        answer,
+        sizeof(answer)
+    );
+
+    if (len < 0) {
+        Debug(
+            &plugin,
+            DebugInfo,
+            "RFC3263 NAPTR query failed for '%s'",
+            domain.c_str()
+        );
+
+        return false;
+    }
+
+    ns_msg handle;
+
+    if (ns_initparse(answer,len,&handle) < 0)
+        return false;
+
+    int count = ns_msg_count(handle,ns_s_an);
+
+    bool found = false;
+
+    for (int i = 0; i < count; ++i) {
+
+        ns_rr rr;
+
+        if (ns_parserr(&handle,ns_s_an,i,&rr) < 0)
+            continue;
+
+        if (ns_rr_type(rr) != ns_t_naptr)
+            continue;
+
+        const unsigned char* data = ns_rr_rdata(rr);
+        int rdlen = ns_rr_rdlen(rr);
+
+        if (!data || rdlen < 5)
+            continue;
+
+        const unsigned char* p = data;
+        const unsigned char* end = data + rdlen;
+
+        unsigned int order = ns_get16(p);
+        p += 2;
+
+        unsigned int preference = ns_get16(p);
+        p += 2;
+
+        /*
+         * flags
+         */
+        if (p >= end)
+            continue;
+
+        unsigned int n = *p++;
+
+        if (p + n > end)
+            continue;
+
+        String flags((const char*)p,n);
+        p += n;
+
+        /*
+         * service
+         */
+        if (p >= end)
+            continue;
+
+        n = *p++;
+
+        if (p + n > end)
+            continue;
+
+        String service((const char*)p,n);
+        p += n;
+
+        /*
+         * regexp
+         */
+        if (p >= end)
+            continue;
+
+        n = *p++;
+
+        if (p + n > end)
+            continue;
+
+        p += n;
+
+        /*
+         * replacement
+         */
+        String replacement;
+
+        if (!sipDnsExpandName(
+                answer,
+                len,
+                p,
+                replacement))
+            continue;
+
+        service.toUpper();
+
+        if (service != "SIP+D2U")
+            continue;
+
+        if (!found ||
+            order < selected.order ||
+            (order == selected.order &&
+             preference < selected.preference)) {
+
+            selected.order = order;
+            selected.preference = preference;
+            selected.service = service;
+            selected.replacement = replacement;
+
+            found = true;
+        }
+    }
+
+    if (found) {
+        Debug(
+            &plugin,
+            DebugInfo,
+            "RFC3263 NAPTR selected "
+            "service='%s' replacement='%s' "
+            "order=%u preference=%u",
+            selected.service.c_str(),
+            selected.replacement.c_str(),
+            selected.order,
+            selected.preference
+        );
+    }
+
+    return found;
+}
+
+
+/*
+ * Query SRV.
+ *
+ * First implementation:
+ *
+ * select the lowest priority record.
+ *
+ * SRV weight selection will be added separately after the
+ * basic RFC3263 path has been regression tested.
+ */
+static bool sipDnsSrv(const String& name,
+    SipDnsSrvResult& selected)
+{
+    unsigned char answer[4096];
+
+    Debug(
+        &plugin,
+        DebugAll,
+        "RFC3263 SRV query '%s'",
+        name.c_str()
+    );
+
+    int len = res_query(
+        name.c_str(),
+        ns_c_in,
+        ns_t_srv,
+        answer,
+        sizeof(answer)
+    );
+
+    if (len < 0) {
+        Debug(
+            &plugin,
+            DebugInfo,
+            "RFC3263 SRV query failed for '%s'",
+            name.c_str()
+        );
+
+        return false;
+    }
+
+    ns_msg handle;
+
+    if (ns_initparse(answer,len,&handle) < 0)
+        return false;
+
+    int count = ns_msg_count(handle,ns_s_an);
+
+    bool found = false;
+
+    for (int i = 0; i < count; ++i) {
+
+        ns_rr rr;
+
+        if (ns_parserr(&handle,ns_s_an,i,&rr) < 0)
+            continue;
+
+        if (ns_rr_type(rr) != ns_t_srv)
+            continue;
+
+        const unsigned char* data = ns_rr_rdata(rr);
+
+        if (!data || ns_rr_rdlen(rr) < 7)
+            continue;
+
+        unsigned int priority = ns_get16(data);
+        unsigned int weight = ns_get16(data + 2);
+        unsigned int port = ns_get16(data + 4);
+
+        String target;
+
+        if (!sipDnsExpandName(
+                answer,
+                len,
+                data + 6,
+                target))
+            continue;
+
+        if (!found || priority < selected.priority) {
+
+            selected.priority = priority;
+            selected.weight = weight;
+            selected.port = port;
+            selected.target = target;
+
+            found = true;
+        }
+    }
+
+    if (found) {
+        Debug(
+            &plugin,
+            DebugInfo,
+            "RFC3263 SRV selected "
+            "target='%s' port=%u priority=%u weight=%u",
+            selected.target.c_str(),
+            selected.port,
+            selected.priority,
+            selected.weight
+        );
+    }
+
+    return found;
+}
+
+
+/*
+ * Resolve:
+ *
+ *      SIP domain
+ *          ↓
+ *      NAPTR SIP+D2U
+ *          ↓
+ *      SRV
+ *
+ * We deliberately leave the final A lookup to SocketAddr.
+ *
+ * This avoids duplicating Yate's existing IPv4 host resolver.
+ */
+static bool sipResolve3263Udp(const String& domain,
+    String& host, int& port)
+{
+    host.clear();
+    port = 0;
+
+    if (!domain)
+        return false;
+
+    /*
+     * ------------------------------------------------------------
+     * NAPTR
+     * ------------------------------------------------------------
+     */
+
+    if (s_rfc3263Naptr) {
+
+        SipDnsNaptrResult naptr;
+
+        if (sipDnsNaptrUdp(domain,naptr)) {
+
+            SipDnsSrvResult srv;
+
+            if (sipDnsSrv(naptr.replacement,srv)) {
+
+                host = srv.target;
+                port = srv.port;
+
+                Debug(
+                    &plugin,
+                    DebugInfo,
+                    "RFC3263 resolved '%s' -> "
+                    "udp:%s:%d via NAPTR/SRV",
+                    domain.c_str(),
+                    host.c_str(),
+                    port
+                );
+
+                return true;
+            }
+        }
+    }
+
+
+    /*
+     * ------------------------------------------------------------
+     * SRV fallback
+     *
+     * RFC3263:
+     *
+     *      _sip._udp.<domain>
+     * ------------------------------------------------------------
+     */
+
+    if (s_rfc3263Srv) {
+
+        String srvName("_sip._udp.");
+        srvName += domain;
+
+        SipDnsSrvResult srv;
+
+        if (sipDnsSrv(srvName,srv)) {
+
+            host = srv.target;
+            port = srv.port;
+
+            Debug(
+                &plugin,
+                DebugInfo,
+                "RFC3263 resolved '%s' -> "
+                "udp:%s:%d via SRV",
+                domain.c_str(),
+                host.c_str(),
+                port
+            );
+
+            return true;
+        }
+    }
+
+
+    /*
+     * No NAPTR/SRV result.
+     *
+     * Let existing Yate A resolution handle the original domain.
+     */
+    host = domain;
+    port = 5060;
+
+    Debug(
+        &plugin,
+        DebugInfo,
+        "RFC3263 no NAPTR/SRV for '%s'; "
+        "falling back to A lookup port 5060",
+        domain.c_str()
+    );
+
+    return true;
+}
+
 bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port, const YateSIPLine* line)
 {
     if (message->isAnswer())
@@ -5721,15 +6209,68 @@ bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port
 	        return false;
 	    }
 	
-	    host = nextHopHost.c_str();
+	    int uriPort = target.getPort();
 	
-	    if (port <= 0)
-	        port = target.getPort();
+	    /*
+	     * ============================================================
+	     * RFC 3263
+	     * ============================================================
+	     *
+	     * Only perform DNS service discovery when:
+	     *
+	     *   1. RFC3263 is enabled;
+	     *   2. the URI does NOT contain an explicit port;
+	     *   3. this isn't an externally supplied host override.
+	     *
+	     * An explicit SIP URI port always wins.
+	     * ============================================================
+	     */
+	
+	    if (s_rfc3263 && uriPort <= 0) {
+	
+	        String resolvedHost;
+	        int resolvedPort = 0;
+	
+	        if (sipResolve3263Udp(
+	                nextHopHost,
+	                resolvedHost,
+	                resolvedPort)) {
+	
+	            Debug(
+	                &plugin,
+	                DebugInfo,
+	                "RFC3263 next hop "
+	                "URI='%s' domain='%s' "
+	                "resolved='udp:%s:%d'",
+	                nextHopUri.c_str(),
+	                nextHopHost.c_str(),
+	                resolvedHost.c_str(),
+	                resolvedPort
+	            );
+	
+	            nextHopHost = resolvedHost;
+	            port = resolvedPort;
+	        }
+	    }
+	    else if (uriPort > 0) {
+	
+	        /*
+	         * Explicit URI port:
+	         *
+	         *     sip:scscf.example.net:6060
+	         *
+	         * Do NOT perform NAPTR/SRV.
+	         */
+	        port = uriPort;
+	    }
+	
+	    host = nextHopHost.c_str();
 	
 	    Debug(
 	        &plugin,
 	        DebugAll,
-	        "SIP next hop URI='%s' host='%s' port=%d source=%s",
+	        "SIP next hop URI='%s' "
+	        "host='%s' port=%d source=%s",
 	        nextHopUri.c_str(),
 	        host,
 	        port,
