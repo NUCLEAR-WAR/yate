@@ -5589,19 +5589,68 @@ bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port
     if (!trans)
 	return false;
     // Build an udp party
-    URI uri(message->uri);
-    if (line) {
-	if (!host)
-	    host = line->getPartyAddr();
-	if (port <= 0)
-	    port = line->getPartyPort();
-	line->setupAuth(message);
-    }
-    if (!host) {
-	host = uri.getHost().safe();
-	if (port <= 0)
-	    port = uri.getPort();
-    }
+	URI uri(message->uri);
+	
+	if (line) {
+	    if (!host)
+	        host = line->getPartyAddr();
+	    if (port <= 0)
+	        port = line->getPartyPort();
+	    line->setupAuth(message);
+	}
+	
+	/*
+	 * RFC 3261 loose routing:
+	 *
+	 * If an outgoing request contains a Route header, the
+	 * network next hop is the top Route URI.
+	 *
+	 * The Request-URI remains the remote target.
+	 *
+	 * This is especially important for dialog requests:
+	 *
+	 *   ACK sip:mrf
+	 *   Route: <sip:scscf;lr>
+	 *   Route: <sip:tas;lr>
+	 *
+	 * must be transmitted to the S-CSCF, not directly to the
+	 * Request-URI and not to a peer retained from the initial
+	 * transaction.
+	 */
+	if (!host) {
+	    const MimeHeaderLine* route = message->getHeader("Route");
+	
+	    if (route) {
+	        String routeUri = *route;
+	
+	        static Regexp angled("^[^<]*<\\([^>]*\\)>.*$");
+	
+	        if (routeUri.matches(angled))
+	            routeUri = routeUri.matchString(1);
+	
+	        URI ruri(routeUri);
+	
+	        host = ruri.getHost().safe();
+	
+	        if (port <= 0)
+	            port = ruri.getPort();
+	
+	        Debug(&plugin,DebugAll,
+	            "SIP loose-route next hop '%s:%d' from Route '%s'",
+	            host,port,routeUri.c_str());
+	    }
+	
+	    /*
+	     * No Route:
+	     * use the Request-URI normally.
+	     */
+	    if (!host) {
+	        host = uri.getHost().safe();
+	
+	        if (port <= 0)
+	            port = uri.getPort();
+	    }
+	}
     if (port <= 0)
 	port = 5060;
     trans->lock();
