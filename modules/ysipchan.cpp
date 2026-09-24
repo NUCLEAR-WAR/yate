@@ -6145,6 +6145,22 @@ static bool sipResolve3263(const String& domain,
 
                 return true;
             }
+
+            /*
+             * A usable NAPTR selected a specific service, but its SRV
+             * lookup failed. Do not invent another transport choice here.
+             * Leave host/port/transport untouched and let buildParty()
+             * continue with Yate's original destination handling.
+             */
+            Debug(
+                &plugin,
+                DebugInfo,
+                "RFC3263 SRV lookup for NAPTR replacement '%s' failed; "
+                "using original Yate destination handling for '%s'",
+                naptr.replacement.c_str(),
+                domain.c_str()
+            );
+            return false;
         }
     }
 
@@ -6222,29 +6238,22 @@ static bool sipResolve3263(const String& domain,
 	}
 
     /*
-     * ------------------------------------------------------------
-     * No NAPTR/SRV.
+     * No usable NAPTR/SRV result.
      *
-     * RFC3263 final FQDN/A fallback.
-     *
-     * For sip: use UDP/5060 as the normal default.
-     * ------------------------------------------------------------
+     * This helper is deliberately additive: it reports success only when
+     * RFC3263 discovery produced a concrete next hop. On failure it leaves
+     * host/port/transport untouched and returns false, so buildParty() uses
+     * the original SIP domain, UDP and Yate's normal SocketAddr resolver.
      */
-
-    host = domain;
-    port = 5060;
-    transport = ProtocolHolder::Udp;
-
     Debug(
         &plugin,
         DebugInfo,
-        "RFC3263 no NAPTR/SRV for '%s'; "
-        "falling back to udp:%s:5060",
-        domain.c_str(),
+        "RFC3263 discovery produced no usable NAPTR/SRV result for '%s'; "
+        "using original Yate destination handling",
         domain.c_str()
     );
 
-    return true;
+    return false;
 }
 
 bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port, const YateSIPLine* line)
@@ -6254,10 +6263,11 @@ bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port
     Debug(&plugin,DebugAll,"YateSIPEndPoint::buildParty(%p,'%s',%d,%p)",
 	message,host,port,line);
     if (line && line->setSipParty(message,line))
-	return true;
-	int selectedTransport = ProtocolHolder::Udp;
-    // Build an udp party
-	URI uri(message->uri);
+        return true;
+
+    int selectedTransport = ProtocolHolder::Udp;
+    // Build a SIP party. UDP remains Yate's default unless RFC3263 succeeds.
+    URI uri(message->uri);
 	
 	/*
 	 * Own storage for the selected host.
