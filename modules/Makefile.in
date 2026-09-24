@@ -411,6 +411,8 @@ faxchan.yate: EXTERNLIBS = $(SPANDSP_LIB)
 ysipchan.yate: ../libs/ysip/libyatesip.a ../libs/ysdp/libyatesdp.a
 ysipchan.yate: LOCALFLAGS = -I@top_srcdir@/libs/ysip -I@top_srcdir@/libs/ysdp
 ysipchan.yate: LOCALLIBS = -L../libs/ysip -lyatesip -L../libs/ysdp -lyatesdp
+ysipchan.yate: EXTERNFLAGS = @RESOLV_INC@
+ysipchan.yate: EXTERNLIBS = @RESOLV_LIB@
 
 yrtpchan.yate: ../libs/yrtp/libyatertp.a
 yrtpchan.yate: LOCALFLAGS = -I@top_srcdir@/libs/yrtp
