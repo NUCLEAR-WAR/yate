@@ -5591,6 +5591,15 @@ bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port
     // Build an udp party
 	URI uri(message->uri);
 	
+	/*
+	 * Keep storage for the selected next-hop host alive for the
+	 * complete lifetime of this function.
+	 *
+	 * Do not assign 'host' directly to String data owned by a
+	 * temporary URI object.
+	 */
+	String nextHopHost;
+	
 	if (line) {
 	    if (!host)
 	        host = line->getPartyAddr();
@@ -5600,22 +5609,11 @@ bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port
 	}
 	
 	/*
-	 * RFC 3261 loose routing:
+	 * RFC 3261 dialog routing.
 	 *
-	 * If an outgoing request contains a Route header, the
-	 * network next hop is the top Route URI.
-	 *
-	 * The Request-URI remains the remote target.
-	 *
-	 * This is especially important for dialog requests:
-	 *
-	 *   ACK sip:mrf
-	 *   Route: <sip:scscf;lr>
-	 *   Route: <sip:tas;lr>
-	 *
-	 * must be transmitted to the S-CSCF, not directly to the
-	 * Request-URI and not to a peer retained from the initial
-	 * transaction.
+	 * For a loose-routed request, the Request-URI remains the
+	 * remote target while the top Route URI determines the
+	 * network next hop.
 	 */
 	if (!host) {
 	    const MimeHeaderLine* route = message->getHeader("Route");
@@ -5628,31 +5626,43 @@ bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port
 	        if (routeUri.matches(angled))
 	            routeUri = routeUri.matchString(1);
 	
-	        URI ruri(routeUri);
+	        URI routeTarget(routeUri);
 	
-	        host = ruri.getHost().safe();
+	        /*
+	         * COPY the host.
+	         *
+	         * routeTarget is temporary, therefore we must not keep
+	         * a pointer to routeTarget.getHost().
+	         */
+	        nextHopHost = routeTarget.getHost();
 	
-	        if (port <= 0)
-	            port = ruri.getPort();
+	        if (nextHopHost) {
+	            host = nextHopHost.c_str();
 	
-	        Debug(&plugin,DebugAll,
-	            "SIP loose-route next hop '%s:%d' from Route '%s'",
-	            host,port,routeUri.c_str());
+	            if (port <= 0)
+	                port = routeTarget.getPort();
+	
+	            Debug(&plugin,DebugAll,
+	                "SIP loose-route next hop '%s:%d' from Route '%s'",
+	                host,port,routeUri.c_str());
+	        }
 	    }
 	
 	    /*
-	     * No Route:
-	     * use the Request-URI normally.
+	     * No usable Route header:
+	     * use the Request-URI as the next hop.
 	     */
 	    if (!host) {
-	        host = uri.getHost().safe();
+	        nextHopHost = uri.getHost();
+	        host = nextHopHost.c_str();
 	
 	        if (port <= 0)
 	            port = uri.getPort();
 	    }
 	}
-    if (port <= 0)
-	port = 5060;
+	
+	if (port <= 0)
+	    port = 5060;
     trans->lock();
     int f = trans->local().family();
     trans->unlock();
