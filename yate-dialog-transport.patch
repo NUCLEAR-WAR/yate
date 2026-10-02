@@ -1,0 +1,461 @@
+diff --git a/libs/ysip/message.cpp b/libs/ysip/message.cpp
+index cd73966..3da6fb6 100644
+--- a/libs/ysip/message.cpp
++++ b/libs/ysip/message.cpp
+@@ -237,6 +237,7 @@ void SIPMessage::complete(SIPEngine* engine, const char* user, const char* domai
+     String partyLAddr = party->getLocalAddr();
+     int partyLPort = party->getLocalPort();
+     String partyVia = party->getVia();
++    String partyProto = party->getProtoName();
+     lckParty.drop();
+ 
+     // only set the dialog tag on ACK
+@@ -370,7 +371,12 @@ void SIPMessage::complete(SIPEngine* engine, const char* user, const char* domai
+ 	if (tmp)
+ 	    tmp = tmp.uriEscape('@',"+?&") + "@";
+ 	tmp = (uri.startsWith("sips:") ? "<sips:" : "<sip:") + tmp;
+-	SocketAddr::appendTo(tmp,partyLAddr,partyLPort) << ">";
++	SocketAddr::appendTo(tmp,partyLAddr,partyLPort);
++	// An IP-based Contact cannot use NAPTR to rediscover TCP. Preserve the
++	// transport for the subsequent ACK, BYE and other dialog requests.
++	if (partyProto &= "TCP")
++	    tmp << ";transport=tcp";
++	tmp << ">";
+ 	addHeader("Contact",tmp);
+     }
+ 
+diff --git a/modules/ysipchan.cpp b/modules/ysipchan.cpp
+index a84c2c1..c9c3190 100644
+--- a/modules/ysipchan.cpp
++++ b/modules/ysipchan.cpp
+@@ -25,6 +25,7 @@
+ 
+ #include <string.h>
+ 
++#include <arpa/inet.h>
+ #include <arpa/nameser.h>
+ #include <resolv.h>
+ 
+@@ -5689,9 +5690,10 @@ static bool getSipNextHopUri(const SIPMessage* msg,
+  *
+  *      s_rfc3263 == true
+  *
+- * and the effective SIP next-hop URI contains no explicit port.
++ * and the effective SIP next-hop URI has a domain name and no explicit port.
+  *
+- * Existing Yate behaviour remains unchanged otherwise.
++ * An explicit URI transport is honored with or without DNS discovery.
++ * When transport is explicit, only its SRV service is queried, not NAPTR.
+  * ================================================================
+  */
+ 
+@@ -6256,6 +6258,66 @@ static bool sipResolve3263(const String& domain,
+     return false;
+ }
+ 
++// Resolve the effective routing URI, preserving an explicit transport even
++// when an explicit port or numeric address disables DNS service discovery.
++static bool sipResolveNextHop(const URI& target, String& host, int& port,
++    int& transport)
++{
++    host = target.getHost();
++    port = target.getPort();
++    transport = ProtocolHolder::Udp;
++    // This discovery path currently implements SIP over UDP and TCP only.
++    // Do not silently downgrade SIPS or an unsupported transport to UDP.
++    if (!host || target.getProtocol() != YSTRING("sip"))
++        return false;
++
++    String extra = target.getExtra();
++    int query = extra.find('?');
++    if (query >= 0)
++        extra = extra.substr(0,query);
++    MimeHeaderLine params("URI",String("uri") + extra);
++    const NamedString* explicitTransport = params.getParam("transport");
++    if (explicitTransport) {
++        transport = ProtocolHolder::lookupProtoAny(*explicitTransport);
++        if (transport != ProtocolHolder::Udp && transport != ProtocolHolder::Tcp) {
++            Debug(&plugin,DebugWarn,"Unsupported SIP next-hop transport '%s'",
++                explicitTransport->c_str());
++            return false;
++        }
++    }
++
++    unsigned char address[16];
++    bool numeric = inet_pton(AF_INET,host.c_str(),address) == 1 ||
++        inet_pton(AF_INET6,host.c_str(),address) == 1;
++    if (s_rfc3263 && !numeric && port <= 0) {
++        if (explicitTransport) {
++            // RFC3263: transport is already chosen; query only its SRV service.
++            // NAPTR must not replace a URI's explicit transport selection.
++            String service(transport == ProtocolHolder::Tcp
++                ? "_sip._tcp." : "_sip._udp.");
++            service += host;
++            SipDnsSrvResult srv;
++            if (s_rfc3263Srv && sipDnsSrv(service,srv)) {
++                host = srv.target;
++                port = srv.port;
++            }
++        }
++        else {
++            String resolvedHost;
++            int resolvedPort = 0;
++            int resolvedTransport = ProtocolHolder::Unknown;
++            if (sipResolve3263(host,resolvedHost,resolvedPort,resolvedTransport)) {
++                host = resolvedHost;
++                port = resolvedPort;
++                transport = resolvedTransport;
++            }
++        }
++    }
++    if (port <= 0)
++        port = 5060;
++    return true;
++}
++
+ bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port, const YateSIPLine* line)
+ {
+     if (message->isAnswer())
+@@ -6266,7 +6328,7 @@ bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port
+         return true;
+ 
+     int selectedTransport = ProtocolHolder::Udp;
+-    // Build a SIP party. UDP remains Yate's default unless RFC3263 succeeds.
++    // UDP is the default unless the routing URI or RFC3263 selects TCP.
+     URI uri(message->uri);
+ 	
+ 	/*
+@@ -6302,81 +6364,12 @@ bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port
+ 	
+ 	    URI target(nextHopUri);
+ 	
+-	    nextHopHost = target.getHost();
+-	
+-	    if (!nextHopHost) {
+-	        Debug(
+-	            &plugin,
+-	            DebugWarn,
+-	            "Invalid SIP next-hop URI '%s'",
+-	            nextHopUri.c_str()
+-	        );
+-	
+-	        return false;
+-	    }
+-	
+-	    int uriPort = target.getPort();
+-	
+-	    /*
+-	     * ============================================================
+-	     * RFC 3263
+-	     * ============================================================
+-	     *
+-	     * Only perform DNS service discovery when:
+-	     *
+-	     *   1. RFC3263 is enabled;
+-	     *   2. the URI does NOT contain an explicit port;
+-	     *   3. this isn't an externally supplied host override.
+-	     *
+-	     * An explicit SIP URI port always wins.
+-	     * ============================================================
+-	     */
+-	
+-	    if (s_rfc3263 && uriPort <= 0) {
+-	
+-			String resolvedHost;
+-			int resolvedPort = 0;
+-			int resolvedTransport = ProtocolHolder::Unknown;
+-			
+-			if (sipResolve3263(
+-			        nextHopHost,
+-			        resolvedHost,
+-			        resolvedPort,
+-			        resolvedTransport)) {
+-	
+-					Debug(
+-					    &plugin,
+-					    DebugInfo,
+-					    "RFC3263 next hop "
+-					    "URI='%s' domain='%s' "
+-					    "resolved='%s:%s:%d'",
+-					    nextHopUri.c_str(),
+-					    nextHopHost.c_str(),
+-					    ProtocolHolder::lookupProtoName(
+-					        resolvedTransport,
+-					        false
+-					    ),
+-					    resolvedHost.c_str(),
+-					    resolvedPort
+-					);
+-	
+-	            nextHopHost = resolvedHost;
+-	            port = resolvedPort;
+-				selectedTransport = resolvedTransport;
+-	        }
+-	    }
+-	    else if (uriPort > 0) {
+-	
+-	        /*
+-	         * Explicit URI port:
+-	         *
+-	         *     sip:scscf.example.net:6060
+-	         *
+-	         * Do NOT perform NAPTR/SRV.
+-	         */
+-	        port = uriPort;
+-	    }
+-	
++        if (!sipResolveNextHop(target,nextHopHost,port,selectedTransport)) {
++            Debug(&plugin,DebugWarn,"Invalid or unsupported SIP next-hop URI '%s'",
++                nextHopUri.c_str());
++            return false;
++        }
++
+ 	    host = nextHopHost.c_str();
+ 	
+ 	    Debug(
+diff --git a/tests/sip_dialog_transport.cpp b/tests/sip_dialog_transport.cpp
+new file mode 100644
+index 0000000..9d8c86b
+--- /dev/null
++++ b/tests/sip_dialog_transport.cpp
+@@ -0,0 +1,220 @@
++// Exercise the production resolver and message completion with deterministic DNS.
++#include "../modules/ysipchan.cpp"
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++static std::vector<std::string> queries;
++static bool dnsAvailable = true;
++static unsigned checks = 0;
++
++static void require(bool ok, const char* description)
++{
++    ++checks;
++    if (!ok) {
++        std::fprintf(stderr,"FAIL: %s\n",description);
++        std::exit(1);
++    }
++}
++
++static void word(std::vector<unsigned char>& data, unsigned value)
++{
++    data.push_back(value >> 8);
++    data.push_back(value & 255);
++}
++
++static void name(std::vector<unsigned char>& data, const char* value)
++{
++    while (*value) {
++        const char* dot = std::strchr(value,'.');
++        unsigned len = dot ? dot - value : std::strlen(value);
++        data.push_back(len);
++        data.insert(data.end(),value,value + len);
++        value += len;
++        if (*value == '.')
++            ++value;
++    }
++    data.push_back(0);
++}
++
++static void textField(std::vector<unsigned char>& data, const char* value)
++{
++    unsigned len = std::strlen(value);
++    data.push_back(len);
++    data.insert(data.end(),value,value + len);
++}
++
++// Override only the DNS query boundary; real Yate DNS parsing remains in use.
++extern "C" int res_query(const char* query, int dnsClass, int type,
++    unsigned char* answer, int answerLen)
++{
++    queries.push_back(std::string(query) + ":" + std::to_string(type));
++    if (!dnsAvailable || dnsClass != ns_c_in)
++        return -1;
++    std::vector<unsigned char> rdata;
++    if (type == ns_t_naptr && !std::strcmp(query,"ims.test.invalid")) {
++        word(rdata,10);
++        word(rdata,10);
++        textField(rdata,"s");
++        textField(rdata,"SIP+D2T");
++        textField(rdata,"");
++        name(rdata,"_sip._tcp.ims.test.invalid");
++    }
++    else if (type == ns_t_srv &&
++        (!std::strcmp(query,"_sip._tcp.ims.test.invalid") ||
++         !std::strcmp(query,"_sip._udp.ims.test.invalid"))) {
++        word(rdata,0);
++        word(rdata,0);
++        word(rdata,6060);
++        name(rdata,"next.test.invalid");
++    }
++    else
++        return -1;
++    std::vector<unsigned char> packet;
++    word(packet,1);
++    word(packet,0x8180);
++    word(packet,0);
++    word(packet,1);
++    word(packet,0);
++    word(packet,0);
++    name(packet,query);
++    word(packet,type);
++    word(packet,ns_c_in);
++    word(packet,0);
++    word(packet,60);
++    word(packet,rdata.size());
++    packet.insert(packet.end(),rdata.begin(),rdata.end());
++    if (packet.size() > (unsigned)answerLen)
++        return -1;
++    std::memcpy(answer,&packet[0],packet.size());
++    return packet.size();
++}
++
++static void resolve(const char* value, const char* expectedHost, int expectedPort,
++    int expectedTransport, unsigned expectedQueries)
++{
++    queries.clear();
++    String host;
++    int port = 0;
++    int transport = ProtocolHolder::Unknown;
++    require(sipResolveNextHop(URI(value),host,port,transport),value);
++    require(host == expectedHost,"next-hop host");
++    require(port == expectedPort,"next-hop port");
++    require(transport == expectedTransport,"next-hop transport");
++    require(queries.size() == expectedQueries,"DNS query count");
++}
++
++class TestParty : public SIPParty
++{
++public:
++    TestParty(const char* proto) : SIPParty(!std::strcmp(proto,"TCP")), m_proto(proto)
++    {
++        setAddr("172.22.0.50",5080,true);
++        setAddr("172.22.0.20",6060,false);
++    }
++    virtual bool transmit(SIPEvent*) { return true; }
++    virtual const char* getProtoName() const { return m_proto.c_str(); }
++    virtual bool setParty(const URI&) { return true; }
++    virtual void* getTransport() { return 0; }
++private:
++    String m_proto;
++};
++
++class TestEngine : public SIPEngine
++{
++public:
++    TestEngine() : SIPEngine("transport-regression") {}
++    virtual bool buildParty(SIPMessage*) { return false; }
++    virtual void allocTraceId(String&) {}
++    virtual void traceMsg(SIPMessage*,bool) {}
++};
++
++static void contact(TestEngine& engine, const char* proto, const char* expected)
++{
++    TestParty* party = new TestParty(proto);
++    SIPMessage* invite = new SIPMessage("INVITE","sip:08001234@172.22.0.50:5080");
++    invite->setParty(party);
++    invite->complete(&engine,"08001234");
++    SIPMessage* reply = new SIPMessage(invite,200,"OK");
++    reply->complete(&engine,"08001234",0,"test-tag");
++    const MimeHeaderLine* header = reply->getHeader("Contact");
++    require(header && *header == expected,"200 OK Contact");
++    SIPMessage* trying = new SIPMessage(invite,100,"Trying");
++    trying->complete(&engine,"08001234");
++    require(!trying->getHeader("Contact"),"100 Trying has no Contact");
++    SIPMessage* custom = new SIPMessage(invite,200,"OK");
++    custom->addHeader("Contact","<sip:mgcf@mgcf.test.invalid>");
++    custom->complete(&engine,"08001234");
++    require(*custom->getHeader("Contact") == "<sip:mgcf@mgcf.test.invalid>",
++        "explicit Contact preserved");
++    TelEngine::destruct(custom);
++    TelEngine::destruct(trying);
++    TelEngine::destruct(reply);
++    TelEngine::destruct(invite);
++    TelEngine::destruct(party);
++}
++
++int main()
++{
++    s_rfc3263 = s_rfc3263Naptr = s_rfc3263Srv = true;
++    resolve("sip:mo@172.22.0.20:6060;transport=tcp;lr;did=973.2211",
++        "172.22.0.20",6060,ProtocolHolder::Tcp,0);
++    resolve("sip:08001234@172.22.0.50:5080;transport=TCP",
++        "172.22.0.50",5080,ProtocolHolder::Tcp,0);
++    resolve("sip:08001234@172.22.0.50:5080",
++        "172.22.0.50",5080,ProtocolHolder::Udp,0);
++    resolve("sip:1001@[2001:db8::1];transport=tcp",
++        "2001:db8::1",5060,ProtocolHolder::Tcp,0);
++    resolve("sip:1001@ims.test.invalid:5080;transport=tcp",
++        "ims.test.invalid",5080,ProtocolHolder::Tcp,0);
++    resolve("sip:1001;transport=udp@172.22.0.20:6060;transport=tcp?x=transport=udp",
++        "172.22.0.20",6060,ProtocolHolder::Tcp,0);
++
++    resolve("sip:1001@ims.test.invalid;transport=tcp",
++        "next.test.invalid",6060,ProtocolHolder::Tcp,1);
++    require(queries[0] == "_sip._tcp.ims.test.invalid:33","explicit TCP uses TCP SRV");
++    resolve("sip:1001@ims.test.invalid;transport=udp",
++        "next.test.invalid",6060,ProtocolHolder::Udp,1);
++    require(queries[0] == "_sip._udp.ims.test.invalid:33","explicit UDP uses UDP SRV");
++    resolve("sip:1001@ims.test.invalid",
++        "next.test.invalid",6060,ProtocolHolder::Tcp,2);
++    require(queries[0] == "ims.test.invalid:35" &&
++        queries[1] == "_sip._tcp.ims.test.invalid:33","NAPTR/SRV discovery retained");
++    dnsAvailable = false;
++    resolve("sip:1001@ims.test.invalid;transport=tcp",
++        "ims.test.invalid",5060,ProtocolHolder::Tcp,1);
++    dnsAvailable = true;
++    s_rfc3263 = false;
++    resolve("sip:1001@ims.test.invalid;transport=tcp",
++        "ims.test.invalid",5060,ProtocolHolder::Tcp,0);
++    s_rfc3263 = true;
++
++    String host;
++    int port, transport;
++    require(!sipResolveNextHop(URI("sips:1001@ims.test.invalid"),host,port,transport),
++        "SIPS cannot silently downgrade to UDP");
++    require(!sipResolveNextHop(URI("sip:1001@ims.test.invalid;transport=ws"),host,port,transport),
++        "unsupported transport cannot silently downgrade to UDP");
++
++    SIPMessage* bye = new SIPMessage("BYE","sip:1001@192.168.199.103:58086;transport=tcp");
++    bye->addHeader("Route","<sip:mo@172.22.0.20:6060;transport=tcp;lr>, <sip:other.test.invalid;lr>");
++    String hop;
++    bool fromRoute = false;
++    require(getSipNextHopUri(bye,hop,fromRoute) && fromRoute,"BYE uses top Route");
++    resolve(hop,"172.22.0.20",6060,ProtocolHolder::Tcp,0);
++    require(bye->uri == "sip:1001@192.168.199.103:58086;transport=tcp",
++        "next-hop resolution preserves Request-URI");
++    SIPMessage* ack = new SIPMessage("ACK","sip:08001234@172.22.0.50:5080;transport=tcp");
++    require(getSipNextHopUri(ack,hop,fromRoute) && !fromRoute,"ACK without Route uses Contact target");
++    resolve(hop,"172.22.0.50",5080,ProtocolHolder::Tcp,0);
++    TelEngine::destruct(bye);
++    TelEngine::destruct(ack);
++
++    TestEngine engine;
++    contact(engine,"TCP","<sip:08001234@172.22.0.50:5080;transport=tcp>");
++    contact(engine,"UDP","<sip:08001234@172.22.0.50:5080>");
++    std::printf("PASS: %u SIP dialog transport checks\n",checks);
++    return 0;
++}
+diff --git a/tests/test_sip_dialog_transport.sh b/tests/test_sip_dialog_transport.sh
+new file mode 100644
+index 0000000..c549a27
+--- /dev/null
++++ b/tests/test_sip_dialog_transport.sh
+@@ -0,0 +1,14 @@
++#!/bin/sh
++# Run from a configured Yate source tree; requires a C++11-capable compiler.
++set -eu
++cd "$(dirname "$0")/.."
++make -j2 engine
++make -C modules -j2 ysipchan.yate
++test_binary=$(mktemp "${TMPDIR:-/tmp}/yate-sip-transport.XXXXXX")
++trap 'rm -f "$test_binary"' EXIT HUP INT TERM
++${CXX:-c++} -std=c++11 -O2 -fno-exceptions -DHAVE_GCC_FORMAT_CHECK \
++    -DHAVE_BLOCK_RETURN -DATOMIC_OPS -I. -Ilibs/ysip -Ilibs/ysdp \
++    tests/sip_dialog_transport.cpp -L. -Llibs/ysip -Llibs/ysdp \
++    -lyatesip -lyatesdp -lyate -lresolv -lpthread -Wl,-rpath,"$(pwd)" \
++    -o "$test_binary"
++"$test_binary"

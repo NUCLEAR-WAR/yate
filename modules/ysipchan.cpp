@@ -25,6 +25,7 @@
 
 #include <string.h>
 
+#include <arpa/inet.h>
 #include <arpa/nameser.h>
 #include <resolv.h>
 
@@ -5689,9 +5690,10 @@ static bool getSipNextHopUri(const SIPMessage* msg,
  *
  *      s_rfc3263 == true
  *
- * and the effective SIP next-hop URI contains no explicit port.
+ * and the effective SIP next-hop URI has a domain name and no explicit port.
  *
- * Existing Yate behaviour remains unchanged otherwise.
+ * An explicit URI transport is honored with or without DNS discovery.
+ * When transport is explicit, only its SRV service is queried, not NAPTR.
  * ================================================================
  */
 
@@ -6256,6 +6258,66 @@ static bool sipResolve3263(const String& domain,
     return false;
 }
 
+// Resolve the effective routing URI, preserving an explicit transport even
+// when an explicit port or numeric address disables DNS service discovery.
+static bool sipResolveNextHop(const URI& target, String& host, int& port,
+    int& transport)
+{
+    host = target.getHost();
+    port = target.getPort();
+    transport = ProtocolHolder::Udp;
+    // This discovery path currently implements SIP over UDP and TCP only.
+    // Do not silently downgrade SIPS or an unsupported transport to UDP.
+    if (!host || target.getProtocol() != YSTRING("sip"))
+        return false;
+
+    String extra = target.getExtra();
+    int query = extra.find('?');
+    if (query >= 0)
+        extra = extra.substr(0,query);
+    MimeHeaderLine params("URI",String("uri") + extra);
+    const NamedString* explicitTransport = params.getParam("transport");
+    if (explicitTransport) {
+        transport = ProtocolHolder::lookupProtoAny(*explicitTransport);
+        if (transport != ProtocolHolder::Udp && transport != ProtocolHolder::Tcp) {
+            Debug(&plugin,DebugWarn,"Unsupported SIP next-hop transport '%s'",
+                explicitTransport->c_str());
+            return false;
+        }
+    }
+
+    unsigned char address[16];
+    bool numeric = inet_pton(AF_INET,host.c_str(),address) == 1 ||
+        inet_pton(AF_INET6,host.c_str(),address) == 1;
+    if (s_rfc3263 && !numeric && port <= 0) {
+        if (explicitTransport) {
+            // RFC3263: transport is already chosen; query only its SRV service.
+            // NAPTR must not replace a URI's explicit transport selection.
+            String service(transport == ProtocolHolder::Tcp
+                ? "_sip._tcp." : "_sip._udp.");
+            service += host;
+            SipDnsSrvResult srv;
+            if (s_rfc3263Srv && sipDnsSrv(service,srv)) {
+                host = srv.target;
+                port = srv.port;
+            }
+        }
+        else {
+            String resolvedHost;
+            int resolvedPort = 0;
+            int resolvedTransport = ProtocolHolder::Unknown;
+            if (sipResolve3263(host,resolvedHost,resolvedPort,resolvedTransport)) {
+                host = resolvedHost;
+                port = resolvedPort;
+                transport = resolvedTransport;
+            }
+        }
+    }
+    if (port <= 0)
+        port = 5060;
+    return true;
+}
+
 bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port, const YateSIPLine* line)
 {
     if (message->isAnswer())
@@ -6266,7 +6328,7 @@ bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port
         return true;
 
     int selectedTransport = ProtocolHolder::Udp;
-    // Build a SIP party. UDP remains Yate's default unless RFC3263 succeeds.
+    // UDP is the default unless the routing URI or RFC3263 selects TCP.
     URI uri(message->uri);
 	
 	/*
@@ -6302,81 +6364,12 @@ bool YateSIPEndPoint::buildParty(SIPMessage* message, const char* host, int port
 	
 	    URI target(nextHopUri);
 	
-	    nextHopHost = target.getHost();
-	
-	    if (!nextHopHost) {
-	        Debug(
-	            &plugin,
-	            DebugWarn,
-	            "Invalid SIP next-hop URI '%s'",
-	            nextHopUri.c_str()
-	        );
-	
-	        return false;
-	    }
-	
-	    int uriPort = target.getPort();
-	
-	    /*
-	     * ============================================================
-	     * RFC 3263
-	     * ============================================================
-	     *
-	     * Only perform DNS service discovery when:
-	     *
-	     *   1. RFC3263 is enabled;
-	     *   2. the URI does NOT contain an explicit port;
-	     *   3. this isn't an externally supplied host override.
-	     *
-	     * An explicit SIP URI port always wins.
-	     * ============================================================
-	     */
-	
-	    if (s_rfc3263 && uriPort <= 0) {
-	
-			String resolvedHost;
-			int resolvedPort = 0;
-			int resolvedTransport = ProtocolHolder::Unknown;
-			
-			if (sipResolve3263(
-			        nextHopHost,
-			        resolvedHost,
-			        resolvedPort,
-			        resolvedTransport)) {
-	
-					Debug(
-					    &plugin,
-					    DebugInfo,
-					    "RFC3263 next hop "
-					    "URI='%s' domain='%s' "
-					    "resolved='%s:%s:%d'",
-					    nextHopUri.c_str(),
-					    nextHopHost.c_str(),
-					    ProtocolHolder::lookupProtoName(
-					        resolvedTransport,
-					        false
-					    ),
-					    resolvedHost.c_str(),
-					    resolvedPort
-					);
-	
-	            nextHopHost = resolvedHost;
-	            port = resolvedPort;
-				selectedTransport = resolvedTransport;
-	        }
-	    }
-	    else if (uriPort > 0) {
-	
-	        /*
-	         * Explicit URI port:
-	         *
-	         *     sip:scscf.example.net:6060
-	         *
-	         * Do NOT perform NAPTR/SRV.
-	         */
-	        port = uriPort;
-	    }
-	
+        if (!sipResolveNextHop(target,nextHopHost,port,selectedTransport)) {
+            Debug(&plugin,DebugWarn,"Invalid or unsupported SIP next-hop URI '%s'",
+                nextHopUri.c_str());
+            return false;
+        }
+
 	    host = nextHopHost.c_str();
 	
 	    Debug(
