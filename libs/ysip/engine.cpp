@@ -208,6 +208,45 @@ SIPEngine::~SIPEngine()
     DDebug(this,DebugInfo,"SIPEngine::~SIPEngine() [%p]",this);
 }
 
+String SIPEngine::getContactHost()
+{
+    Lock lock(this);
+    return m_contactHost;
+}
+
+bool SIPEngine::setContactHost(const String& host)
+{
+    String value(host);
+    value.trimBlanks();
+    if (value.length() > 1 && value.endsWith("."))
+        value = value.substr(0,value.length() - 1);
+    bool valid = value.length() <= 253;
+    unsigned int label = 0;
+    char previous = 0;
+    char first = 0;
+    for (unsigned int i = 0; valid && i < value.length(); ++i) {
+        char c = value[i];
+        bool alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        bool digit = c >= '0' && c <= '9';
+        if (c == '.') {
+            valid = label && previous != '-';
+            label = 0;
+        }
+        else {
+            if (!label)
+                first = c;
+            valid = (alpha || digit || (c == '-' && label)) && ++label <= 63;
+        }
+        previous = c;
+    }
+    if (value)
+        valid = valid && label && previous != '-' &&
+            ((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z'));
+    Lock lock(this);
+    m_contactHost = valid ? value : String::empty();
+    return valid;
+}
+
 SIPTransaction* SIPEngine::addMessage(SIPParty* ep, const char* buf, int len)
 {
     DDebug(this,DebugInfo,"addMessage(%p,%d) [%p]",buf,len,this);
