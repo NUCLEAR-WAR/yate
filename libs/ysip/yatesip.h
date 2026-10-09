@@ -1779,6 +1779,18 @@ public:
 	{ return m_userAgent; }
 
     /**
+     * Get a snapshot of the advertised Contact FQDN (empty uses the socket).
+     */
+    String getContactHost();
+
+    /**
+     * Set the advertised Contact FQDN. Port and transport are omitted so the
+     * recipient can use RFC 3263 DNS discovery. Empty disables the override.
+     * Invalid values clear the override and return false.
+     */
+    bool setContactHost(const String& host);
+
+    /**
      * Get the Command Sequence Number generator
      * @return Pointer to the CSeq generator of this engine
      */
@@ -1926,6 +1938,7 @@ protected:
     int m_flags;
     bool m_lazyTrying;
     String m_userAgent;
+    String m_contactHost;
     String m_allowed;
     RefPointer<SIPSequence> m_seq;
     u_int32_t m_nc;
