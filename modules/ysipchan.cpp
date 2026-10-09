@@ -5301,6 +5301,8 @@ void YateSIPEngine::initialize(NamedList* params)
     if (!params)
 	params = &dummy;
     lazyTrying(params->getBoolValue("lazy100",false));
+    if (!setContactHost(params->getValue("contact_host")))
+        Debug(this,DebugWarn,"Invalid contact_host: expected a DNS hostname only; using socket Contact");
     m_fork = params->getBoolValue("fork",true);
     m_forkEarly = params->getBoolValue("fork_early",false);
     m_flags = params->getIntValue("flags",m_flags);
