@@ -371,10 +371,16 @@ void SIPMessage::complete(SIPEngine* engine, const char* user, const char* domai
 	if (tmp)
 	    tmp = tmp.uriEscape('@',"+?&") + "@";
 	tmp = (uri.startsWith("sips:") ? "<sips:" : "<sip:") + tmp;
-	SocketAddr::appendTo(tmp,partyLAddr,partyLPort);
-	// Preserve TCP for requests sent to this numeric Contact URI.
-	if (partyProto &= "TCP")
-	    tmp << ";transport=tcp";
+	String contactHost = engine->getContactHost();
+	if (contactHost)
+	    // Let RFC 3263 DNS select the transport and port for this FQDN.
+	    tmp << contactHost;
+	else {
+	    SocketAddr::appendTo(tmp,partyLAddr,partyLPort);
+	    // Preserve TCP for requests sent to this numeric Contact URI.
+	    if (partyProto &= "TCP")
+		tmp << ";transport=tcp";
+	}
 	tmp << ">";
 	addHeader("Contact",tmp);
     }
