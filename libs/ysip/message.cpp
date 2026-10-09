@@ -237,6 +237,7 @@ void SIPMessage::complete(SIPEngine* engine, const char* user, const char* domai
     String partyLAddr = party->getLocalAddr();
     int partyLPort = party->getLocalPort();
     String partyVia = party->getVia();
+    String partyProto = party->getProtoName();
     lckParty.drop();
 
     // only set the dialog tag on ACK
@@ -370,7 +371,11 @@ void SIPMessage::complete(SIPEngine* engine, const char* user, const char* domai
 	if (tmp)
 	    tmp = tmp.uriEscape('@',"+?&") + "@";
 	tmp = (uri.startsWith("sips:") ? "<sips:" : "<sip:") + tmp;
-	SocketAddr::appendTo(tmp,partyLAddr,partyLPort) << ">";
+	SocketAddr::appendTo(tmp,partyLAddr,partyLPort);
+	// Preserve TCP for requests sent to this numeric Contact URI.
+	if (partyProto &= "TCP")
+	    tmp << ";transport=tcp";
+	tmp << ">";
 	addHeader("Contact",tmp);
     }
 
